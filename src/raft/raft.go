@@ -18,16 +18,20 @@ package raft
 //
 
 import (
-//	"bytes"
+	rand2 "math/rand"
+	"time"
+
+	//	"bytes"
 	"sync"
 	"sync/atomic"
 
-//	"6.824/labgob"
+	//	"6.824/labgob"
 	"6.824/labrpc"
 )
 
+const emptyVotedFor = -1
 
-//
+// ApplyMsg
 // as each Raft peer becomes aware that successive log entries are
 // committed, the peer should send an ApplyMsg to the service (or
 // tester) on the same server, via the applyCh passed to Make(). set
@@ -50,7 +54,10 @@ type ApplyMsg struct {
 	SnapshotIndex int
 }
 
-//
+type LogTemp struct {
+}
+
+// Raft
 // A Go object implementing a single Raft peer.
 //
 type Raft struct {
@@ -64,15 +71,35 @@ type Raft struct {
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
+	//下面三组是论文中指定的
+	// persistent
+	currentTerm int //服务器已知最新的任期（在服务器首次启动的时候初始化为0，单调递增）
+	votedFor    int //当前任期内收到选票的候选者id 如果没有投给任何候选者 则为空
+	log         []LogTemp
+
+	// volatile
+	commitIndex int //已知已提交的最高的日志条目的索引（初始值为0，单调递增）
+	lastApplied int //已被应用到状态机的最高的日志条目的索引（初始值为0，单调递增）
+
+	// volatile on leader (Reinitialized after election)
+	nextIndex  []int // 对于每一台服务器，发送到该服务器的下一个日志条目的索引（初始值为领导者最后的日志条目的索引+1)
+	matchIndex []int // 对每一台服务器，已知的已经复制到该服务器的最高日志条目的索引 (初始值为0 单调递增）
+
+	// for election
+	electionMu     sync.Mutex // 仅为选举数据使用的细粒度锁
+	electionLeftMs int        // 选举倒计时，不应在所有机器上一致，单位毫秒，归零后触发选举, 初值根据lab要求应大于150～300
+	electionCond   sync.Cond  // 选举同步原语, 计时归零后调用Signal
 }
 
-// return currentTerm and whether this server
-// believes it is the leader.
+// GetState return currentTerm and whether this server
+// believes itself is the leader.
 func (rf *Raft) GetState() (int, bool) {
 
 	var term int
 	var isleader bool
 	// Your code here (2A).
+	term = rf.currentTerm
+	isleader = len(rf.nextIndex) != 0
 	return term, isleader
 }
 
@@ -91,7 +118,6 @@ func (rf *Raft) persist() {
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
 }
-
 
 //
 // restore previously persisted state.
@@ -115,8 +141,7 @@ func (rf *Raft) readPersist(data []byte) {
 	// }
 }
 
-
-//
+// CondInstallSnapshot
 // A service wants to switch to snapshot.  Only do so if Raft hasn't
 // have more recent info since it communicate the snapshot on applyCh.
 //
@@ -127,7 +152,7 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 	return true
 }
 
-// the service says it has created a snapshot that has
+// Snapshot the service says it has created a snapshot that has
 // all info up to and including index. this means the
 // service no longer needs the log through (and including)
 // that index. Raft should now trim its log as much as possible.
@@ -136,28 +161,34 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 
 }
 
-
-//
+// RequestVoteArgs
 // example RequestVote RPC arguments structure.
 // field names must start with capital letters!
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
+	term         int
+	candidateId  int
+	lastLogIndex int
+	lastLogTerm  int
 }
 
-//
+// RequestVoteReply
 // example RequestVote RPC reply structure.
 // field names must start with capital letters!
 //
 type RequestVoteReply struct {
 	// Your data here (2A).
+	term        int
+	voteGranted bool
 }
 
-//
+// RequestVote
 // example RequestVote RPC handler.
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+
 }
 
 //
@@ -194,8 +225,7 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
-
-//
+// Start
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
 // server isn't the leader, returns false. otherwise start the
@@ -216,11 +246,10 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	// Your code here (2B).
 
-
 	return index, term, isLeader
 }
 
-//
+// Kill
 // the tester doesn't halt goroutines created by Raft after each test,
 // but it does call the Kill() method. your code can use killed() to
 // check whether Kill() has been called. the use of atomic avoids the
@@ -249,11 +278,42 @@ func (rf *Raft) ticker() {
 		// Your code here to check if a leader election should
 		// be started and to randomize sleeping time using
 		// time.Sleep().
+		rf.electionCond.Wait()
 
 	}
 }
 
-//
+type AppendEntriesArgs struct {
+	term         int       //当前领导者的任期
+	leaderId     int       //领导者ID 因此跟随者可以对客户端进行重定向
+	prevLogIndex int       //紧邻新日志条目之前的那个日志条目的索引
+	prevLogTerm  int       //紧邻新日志条目之前的那个日志条目的任期
+	entries      []LogTemp //需要被保存的日志条目（被当做心跳使用是 则日志条目内容为空；为了提高效率可能一次性发送多个）
+	leaderCommit int       //领导者的已知已提交的最高的日志条目的索引
+}
+
+type AppendEntriesReply struct {
+	term    int  //当前任期,对于领导者而言 它会更新自己的任期
+	success bool //结果为真 如果跟随者所含有的条目和prevLogIndex以及prevLogTerm匹配上了
+}
+
+// AppendEntries leader发起调用：追加日志&&心跳, follower接收
+// 1. 客户端发起写命令请求时 2.发送心跳时 3.日志匹配失败时
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	if args.term < rf.currentTerm {
+		reply.success = false
+		reply.term = rf.currentTerm
+		return
+	}
+	// todo check prevLogIndex/Term or something (for 2B)
+	// for 2A, just use for heartbeats
+	if len(args.entries) == 0 { // heartbeats
+		rf.resetElectionTimeouts()
+	}
+
+}
+
+// Make
 // the service or tester wants to create a Raft server. the ports
 // of all the Raft servers (including this one) are in peers[]. this
 // server's port is peers[me]. all the servers' peers[] arrays
@@ -270,15 +330,39 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
-
 	// Your initialization code here (2A, 2B, 2C).
-
+	rf.currentTerm = 0
+	rf.votedFor = emptyVotedFor
+	rf.log = make([]LogTemp, 0)
+	rf.commitIndex = 0
+	rf.lastApplied = 0
+	rf.nextIndex = make([]int, 0)
+	rf.matchIndex = make([]int, 0)
+	rf.mu = sync.Mutex{}
+	rf.electionMu = sync.Mutex{}
+	rf.electionCond = *sync.NewCond(&rf.electionMu)
+	rf.resetElectionTimeouts()
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
 
-
+	go func() {
+		for {
+			if rf.electionLeftMs == 0 {
+				rf.electionCond.Signal()
+				// todo
+			}
+		}
+	}()
 	return rf
+}
+
+func (rf *Raft) resetElectionTimeouts() {
+	rand2.Seed(time.Now().UnixNano())
+	random := rand2.Intn(150)
+	rf.electionMu.Lock()
+	rf.electionLeftMs = 300 + random
+	rf.electionMu.Unlock()
 }
