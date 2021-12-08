@@ -18,15 +18,16 @@ package raft
 //
 
 import (
+	"fmt"
+	"math/rand"
 	//	"bytes"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	//	"6.824/labgob"
 	"6.824/labrpc"
 )
-
-const emptyVotedFor = -1
 
 // ApplyMsg
 // as each Raft peer becomes aware that successive log entries are
@@ -57,9 +58,13 @@ type LogTemp struct {
 }
 
 const(
+	emptyVotedFor = -1
 	Follower  State = 0
 	Candidate State = 1
 	Leader    State = 2
+	HeartBeatTimeout = time.Millisecond * 150
+	ElectionTimeout = time.Millisecond * 300
+	LockThreshold = time.Millisecond * 10
 )
 
 // Raft
@@ -92,6 +97,16 @@ type Raft struct {
 
 	// election
 	state State		// 由于golang实现状态模式比较困难，因此用变量表示，使用modifyState()进行改变
+	electionTimer	*time.Timer
+	heartbeatsTimer	*time.Timer
+	appendEntryCh	chan struct{}	//收到合法的appendEntry时才会导入该chan
+
+	// lock debug
+	lockName string
+	lockStart time.Time
+	lockEnd	time.Time
+
+	stopCh	chan struct{}
 }
 
 // GetState return currentTerm and whether this server
@@ -102,17 +117,58 @@ func (rf *Raft) GetState() (int, bool) {
 	var isleader bool
 	// Your code here (2A).
 	term = rf.currentTerm
-	isleader = len(rf.nextIndex) != 0
+	isleader = rf.state == Leader
 	return term, isleader
 }
 
+
+// 对rf具体值的修改尽量使用modify原语，降低锁的粒度
 // for pre-job to change state
 func (rf *Raft) modifyState(s State) {
+	defer rf.unlock("modifyState")
+	rf.lock("modifyState")
+	rf.state = s
 	switch s {
 	case Follower:
 	case Candidate:
 	case Leader:
 	}
+}
+
+// if selfIncrease, newTerm can be any value
+func (rf *Raft) modifyTerm(newTerm int, selfIncrease bool) {
+	defer rf.unlock("modifyTerm")
+	rf.lock("modifyTerm")
+	if selfIncrease {
+		rf.currentTerm++
+		rf.printLog("term self-increased")
+	} else if rf.currentTerm != newTerm {
+		rf.currentTerm = newTerm
+		rf.printLog("term modified")
+	}
+}
+
+func (rf *Raft) modifyVoteFor(who int) {
+	defer rf.unlock("modifyVoteFor")
+	rf.lock("modifyVoteFor")
+	rf.votedFor = who
+}
+
+// for lock debug
+func (rf *Raft) lock(name string) {
+	rf.mu.Lock()
+	rf.lockStart = time.Now()
+	rf.lockName = name
+}
+
+func (rf *Raft) unlock(name string) {
+	rf.lockEnd = time.Now()
+	rf.lockName = ""
+	duration := rf.lockEnd.Sub(rf.lockStart)
+	if duration > LockThreshold {
+		rf.printLog("long lock: %s, time: %s", name, duration)
+	}
+	rf.mu.Unlock()
 }
 
 //
@@ -200,7 +256,24 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
-
+	if args.Term < rf.currentTerm {
+		reply.Term = rf.currentTerm
+		reply.VoteGranted = false
+		return
+	}
+	if rf.votedFor == emptyVotedFor {
+		// todo check the log term and index for 2B
+		rf.modifyTerm(args.Term, false)
+		rf.modifyVoteFor(args.CandidateId)
+		rf.modifyState(Follower)
+		reply.VoteGranted = true
+		reply.Term = rf.currentTerm
+		return
+	} else {
+		reply.Term = rf.currentTerm
+		reply.VoteGranted = false
+		return
+	}
 }
 
 //
@@ -275,6 +348,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
+	close(rf.stopCh)
 }
 
 func (rf *Raft) killed() bool {
@@ -295,12 +369,12 @@ func (rf *Raft) ticker() {
 }
 
 type AppendEntriesArgs struct {
-	Term         int       //当前领导者的任期
-	LeaderId     int       //领导者ID 因此跟随者可以对客户端进行重定向
-	PrevLogIndex int       //紧邻新日志条目之前的那个日志条目的索引
-	PrevLogTerm  int       //紧邻新日志条目之前的那个日志条目的任期
-	Entries      []LogTemp //需要被保存的日志条目（被当做心跳使用是 则日志条目内容为空；为了提高效率可能一次性发送多个）
-	LeaderCommit int       //领导者的已知已提交的最高的日志条目的索引
+	Term         int       // 当前领导者的任期
+	LeaderId     int       // 领导者ID 因此跟随者可以对客户端进行重定向
+	PrevLogIndex int       // 紧邻新日志条目之前的那个日志条目的索引
+	PrevLogTerm  int       // 紧邻新日志条目之前的那个日志条目的任期
+	Entries      []LogTemp // 需要被保存的日志条目（被当做心跳使用是 则日志条目内容为空；为了提高效率可能一次性发送多个）
+	LeaderCommit int       // 领导者的已知已提交的最高的日志条目的索引
 }
 
 type AppendEntriesReply struct {
@@ -312,6 +386,7 @@ type AppendEntriesReply struct {
 // 1. 客户端发起写命令请求时 2.发送心跳时 3.日志匹配失败时
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	if args.Term < rf.currentTerm {
+		rf.printLog("receive outdated AppendEntries RPC from leader peer:%d", args.LeaderId)
 		reply.Success = false
 		reply.Term = rf.currentTerm
 		return
@@ -319,9 +394,20 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// todo check prevLogIndex/Term or something (for 2B)
 	// for 2A, just use for heartbeats
 	if len(args.Entries) == 0 { // heartbeats
-
+		rf.printLog("receive heartbeats from leader peer:%d", args.LeaderId)
+		rf.modifyTerm(args.Term, false)
+		rf.appendEntryCh <- struct{}{}
+		reply.Success = true
+		reply.Term = rf.currentTerm
 	}
 
+}
+
+// 为打印内容增加固定前缀
+func (rf *Raft) printLog(format string, i... interface{}) {
+	in := fmt.Sprintf(format, i...)
+	pre := fmt.Sprintf("[Peer:%d Term:%d VoteFor:%d]", rf.me, rf.currentTerm, rf.votedFor)
+	fmt.Println(pre + in)
 }
 
 // Make
@@ -350,16 +436,86 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.nextIndex = make([]int, 0)
 	rf.matchIndex = make([]int, 0)
 	rf.mu = sync.Mutex{}
-
+	rf.appendEntryCh = make(chan struct{}, 100)
+	rf.stopCh = make(chan struct{})
+	rf.electionTimer = time.NewTimer(ElectionTimeout + getRandomTime())
 	// initialize from State persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
-
 	// start ticker goroutine to start elections
 	go rf.ticker()
 
 	go func() {
+		for{
+			select {
+			case <- rf.stopCh:
+				return
+			case <-rf.electionTimer.C:	//无论是选举超时还是心跳超时，都会发起选举
+				go rf.startElection()
+				rf.resetElectionTimeout()
+			case <-rf.appendEntryCh:	//收到合法的appendEntry(心跳)时
+				rf.modifyState(Follower)
+				rf.modifyVoteFor(emptyVotedFor)
+				rf.resetElectionTimeout()
+			}
+		}
+	}()
+
+	go func() {
+		// todo for leader to send the heartbeat
 
 	}()
+
 	return rf
+}
+
+func (rf *Raft) resetElectionTimeout() {
+	rf.electionTimer.Stop()
+	rf.electionTimer.Reset(ElectionTimeout + getRandomTime())
+}
+
+func getRandomTime() time.Duration {
+	rand.Seed(time.Now().UnixNano())
+	return time.Duration(rand.Intn(100)) //[0,100)
+}
+
+func (rf *Raft) startElection() {
+	rf.modifyState(Candidate)
+	nowTerm := rf.currentTerm	// 防止sleep结束后term已经更新
+	time.Sleep((getRandomTime() + 50) * time.Millisecond)
+	if rf.state != Candidate || rf.votedFor != emptyVotedFor || rf.currentTerm != nowTerm {
+		rf.printLog("quit election because %v %v %v", rf.state != Candidate, rf.votedFor != emptyVotedFor, rf.currentTerm != nowTerm)
+		rf.modifyState(Follower)
+		return
+	}
+	rf.printLog("join election")
+	rf.modifyTerm(0, true)
+	rf.modifyVoteFor(rf.me)
+	voteNum := 1
+	for i := range rf.peers {
+		if i == rf.me {
+			continue
+		}
+		args := RequestVoteArgs{
+			Term:        rf.currentTerm,
+			CandidateId: rf.me,
+			// lastLogIndex: 0,// 2A暂时不用
+			// lastLogTerm:  0,
+		}
+		reply := RequestVoteReply{}
+		ok := rf.sendRequestVote(i, &args, &reply)
+		if ok {
+			if reply.VoteGranted {
+				voteNum++
+				rf.printLog("get a vote from peer:%d", i)
+			}
+			if voteNum > len(rf.peers)/2 {
+				// become leader
+				rf.printLog("win the election with voteNum:%d", voteNum)
+				rf.modifyState(Leader)
+				rf.modifyVoteFor(emptyVotedFor)
+				break
+			}
+		}
+	}
 }
 
