@@ -18,9 +18,6 @@ package raft
 //
 
 import (
-	rand2 "math/rand"
-	"time"
-
 	//	"bytes"
 	"sync"
 	"sync/atomic"
@@ -54,22 +51,30 @@ type ApplyMsg struct {
 	SnapshotIndex int
 }
 
+type State int
+
 type LogTemp struct {
 }
+
+const(
+	Follower  State = 0
+	Candidate State = 1
+	Leader    State = 2
+)
 
 // Raft
 // A Go object implementing a single Raft peer.
 //
 type Raft struct {
-	mu        sync.Mutex          // Lock to protect shared access to this peer's state
+	mu        sync.Mutex          // Lock to protect shared access to this peer's State
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
-	persister *Persister          // Object to hold this peer's persisted state
+	persister *Persister          // Object to hold this peer's persisted State
 	me        int                 // this peer's index into peers[]
 	dead      int32               // set by Kill()
 
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
-	// state a Raft server must maintain.
+	// State a Raft server must maintain.
 
 	//下面三组是论文中指定的
 	// persistent
@@ -82,13 +87,11 @@ type Raft struct {
 	lastApplied int //已被应用到状态机的最高的日志条目的索引（初始值为0，单调递增）
 
 	// volatile on leader (Reinitialized after election)
-	nextIndex  []int // 对于每一台服务器，发送到该服务器的下一个日志条目的索引（初始值为领导者最后的日志条目的索引+1)
+	nextIndex  []int // 对于每一台服务器，发送到该服务器的下一个日志条目的索引（初始值为领导者最后的日志条目的索引 +1)
 	matchIndex []int // 对每一台服务器，已知的已经复制到该服务器的最高日志条目的索引 (初始值为0 单调递增）
 
-	// for election
-	electionMu     sync.Mutex // 仅为选举数据使用的细粒度锁
-	electionLeftMs int        // 选举倒计时，不应在所有机器上一致，单位毫秒，归零后触发选举, 初值根据lab要求应大于150～300
-	electionCond   sync.Cond  // 选举同步原语, 计时归零后调用Signal
+	// election
+	state State		// 由于golang实现状态模式比较困难，因此用变量表示，使用modifyState()进行改变
 }
 
 // GetState return currentTerm and whether this server
@@ -103,8 +106,17 @@ func (rf *Raft) GetState() (int, bool) {
 	return term, isleader
 }
 
+// for pre-job to change state
+func (rf *Raft) modifyState(s State) {
+	switch s {
+	case Follower:
+	case Candidate:
+	case Leader:
+	}
+}
+
 //
-// save Raft's persistent state to stable storage,
+// save Raft's persistent State to stable storage,
 // where it can later be retrieved after a crash and restart.
 // see paper's Figure 2 for a description of what should be persistent.
 //
@@ -120,10 +132,10 @@ func (rf *Raft) persist() {
 }
 
 //
-// restore previously persisted state.
+// restore previously persisted State.
 //
 func (rf *Raft) readPersist(data []byte) {
-	if data == nil || len(data) < 1 { // bootstrap without any state?
+	if data == nil || len(data) < 1 { // bootstrap without any State?
 		return
 	}
 	// Your code here (2C).
@@ -167,10 +179,10 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
-	term         int
-	candidateId  int
-	lastLogIndex int
-	lastLogTerm  int
+	Term         int
+	CandidateId  int
+	LastLogIndex int
+	LastLogTerm  int
 }
 
 // RequestVoteReply
@@ -179,8 +191,8 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here (2A).
-	term        int
-	voteGranted bool
+	Term        int
+	VoteGranted bool
 }
 
 // RequestVote
@@ -278,37 +290,36 @@ func (rf *Raft) ticker() {
 		// Your code here to check if a leader election should
 		// be started and to randomize sleeping time using
 		// time.Sleep().
-		rf.electionCond.Wait()
 
 	}
 }
 
 type AppendEntriesArgs struct {
-	term         int       //当前领导者的任期
-	leaderId     int       //领导者ID 因此跟随者可以对客户端进行重定向
-	prevLogIndex int       //紧邻新日志条目之前的那个日志条目的索引
-	prevLogTerm  int       //紧邻新日志条目之前的那个日志条目的任期
-	entries      []LogTemp //需要被保存的日志条目（被当做心跳使用是 则日志条目内容为空；为了提高效率可能一次性发送多个）
-	leaderCommit int       //领导者的已知已提交的最高的日志条目的索引
+	Term         int       //当前领导者的任期
+	LeaderId     int       //领导者ID 因此跟随者可以对客户端进行重定向
+	PrevLogIndex int       //紧邻新日志条目之前的那个日志条目的索引
+	PrevLogTerm  int       //紧邻新日志条目之前的那个日志条目的任期
+	Entries      []LogTemp //需要被保存的日志条目（被当做心跳使用是 则日志条目内容为空；为了提高效率可能一次性发送多个）
+	LeaderCommit int       //领导者的已知已提交的最高的日志条目的索引
 }
 
 type AppendEntriesReply struct {
-	term    int  //当前任期,对于领导者而言 它会更新自己的任期
-	success bool //结果为真 如果跟随者所含有的条目和prevLogIndex以及prevLogTerm匹配上了
+	Term    int  // 当前任期,对于领导者而言 它会更新自己的任期
+	Success bool // 结果为真 如果跟随者所含有的条目和prevLogIndex以及prevLogTerm匹配上了
 }
 
 // AppendEntries leader发起调用：追加日志&&心跳, follower接收
 // 1. 客户端发起写命令请求时 2.发送心跳时 3.日志匹配失败时
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	if args.term < rf.currentTerm {
-		reply.success = false
-		reply.term = rf.currentTerm
+	if args.Term < rf.currentTerm {
+		reply.Success = false
+		reply.Term = rf.currentTerm
 		return
 	}
 	// todo check prevLogIndex/Term or something (for 2B)
 	// for 2A, just use for heartbeats
-	if len(args.entries) == 0 { // heartbeats
-		rf.resetElectionTimeouts()
+	if len(args.Entries) == 0 { // heartbeats
+
 	}
 
 }
@@ -318,8 +329,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 // of all the Raft servers (including this one) are in peers[]. this
 // server's port is peers[me]. all the servers' peers[] arrays
 // have the same order. persister is a place for this server to
-// save its persistent state, and also initially holds the most
-// recent saved state, if any. applyCh is a channel on which the
+// save its persistent State, and also initially holds the most
+// recent saved State, if any. applyCh is a channel on which the
 // tester or service expects Raft to send ApplyMsg messages.
 // Make() must return quickly, so it should start goroutines
 // for any long-running work.
@@ -339,30 +350,16 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.nextIndex = make([]int, 0)
 	rf.matchIndex = make([]int, 0)
 	rf.mu = sync.Mutex{}
-	rf.electionMu = sync.Mutex{}
-	rf.electionCond = *sync.NewCond(&rf.electionMu)
-	rf.resetElectionTimeouts()
-	// initialize from state persisted before a crash
+
+	// initialize from State persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
 
 	go func() {
-		for {
-			if rf.electionLeftMs == 0 {
-				rf.electionCond.Signal()
-				// todo
-			}
-		}
+
 	}()
 	return rf
 }
 
-func (rf *Raft) resetElectionTimeouts() {
-	rand2.Seed(time.Now().UnixNano())
-	random := rand2.Intn(150)
-	rf.electionMu.Lock()
-	rf.electionLeftMs = 300 + random
-	rf.electionMu.Unlock()
-}
