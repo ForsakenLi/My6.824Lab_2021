@@ -20,6 +20,8 @@ package raft
 import (
 	"fmt"
 	"math/rand"
+	"strconv"
+
 	//	"bytes"
 	"sync"
 	"sync/atomic"
@@ -57,14 +59,15 @@ type State int
 type LogTemp struct {
 }
 
-const(
-	emptyVotedFor = -1
-	Follower  State = 0
-	Candidate State = 1
-	Leader    State = 2
-	HeartBeatTimeout = time.Millisecond * 150
-	ElectionTimeout = time.Millisecond * 300
-	LockThreshold = time.Millisecond * 10
+const (
+	emptyVotedFor          = -1
+	Follower         State = 0
+	Candidate        State = 1
+	Leader           State = 2
+	HeartBeatTimeout       = time.Millisecond * 150
+	ElectionTimeout        = time.Millisecond * 300
+	RPCThreshold           = time.Millisecond * 50
+	LockThreshold          = time.Millisecond * 10
 )
 
 // Raft
@@ -96,17 +99,17 @@ type Raft struct {
 	matchIndex []int // 对每一台服务器，已知的已经复制到该服务器的最高日志条目的索引 (初始值为0 单调递增）
 
 	// election
-	state State		// 由于golang实现状态模式比较困难，因此用变量表示，使用modifyState()进行改变
-	electionTimer	*time.Timer
-	heartbeatsTimer	*time.Timer
-	appendEntryCh	chan struct{}	//收到合法的appendEntry时才会导入该chan
+	state         State // 由于golang实现状态模式比较困难，因此用变量表示，使用modifyState()进行改变
+	electionTimer *time.Timer
+	SendTimer     []*time.Timer // leader发起AppendEntries RPC调用计时,如果超时发送一条空的心跳
+	appendEntryCh chan struct{} //收到合法的appendEntry时才会导入该chan
 
 	// lock debug
-	lockName string
+	lockName  string
 	lockStart time.Time
-	lockEnd	time.Time
+	lockEnd   time.Time
 
-	stopCh	chan struct{}
+	stopCh chan struct{}
 }
 
 // GetState return currentTerm and whether this server
@@ -120,7 +123,6 @@ func (rf *Raft) GetState() (int, bool) {
 	isleader = rf.state == Leader
 	return term, isleader
 }
-
 
 // 对rf具体值的修改尽量使用modify原语，降低锁的粒度
 // for pre-job to change state
@@ -306,8 +308,43 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // the struct itself.
 //
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
-	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
-	return ok
+	rpcTimer := time.NewTimer(RPCThreshold)
+	voteTimer := time.NewTimer(2 * RPCThreshold)
+	defer rpcTimer.Stop()
+	defer voteTimer.Stop()
+
+	for !rf.killed() {
+		rpcTimer.Stop()
+		rpcTimer.Reset(RPCThreshold)
+		ch := make(chan bool, 1)
+		r := RequestVoteReply{}
+
+		go func() {
+			ok := rf.peers[server].Call("Raft.RequestVote", args, &r)
+			if ok == false {
+				time.Sleep(time.Millisecond * 10)
+			}
+			ch <- ok
+		}()
+
+		select {
+		case <-voteTimer.C:
+			rf.printLog("Vote request failed: %d -> %d", rf.me, server)
+			return false
+		case <-rpcTimer.C:
+			rf.printLog("RequestVote RPC timeout: %d -> %d", rf.me, server)
+			continue
+		case ok := <-ch:
+			if !ok {
+				continue
+			} else {
+				reply.Term = r.Term
+				reply.VoteGranted = r.VoteGranted
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // Start
@@ -348,7 +385,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
-	close(rf.stopCh)
+	close(rf.stopCh) // 向所有 <-rf.stopCh 发送一个0
 }
 
 func (rf *Raft) killed() bool {
@@ -404,7 +441,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 }
 
 // 为打印内容增加固定前缀
-func (rf *Raft) printLog(format string, i... interface{}) {
+func (rf *Raft) printLog(format string, i ...interface{}) {
 	in := fmt.Sprintf(format, i...)
 	pre := fmt.Sprintf("[Peer:%d Term:%d VoteFor:%d]", rf.me, rf.currentTerm, rf.votedFor)
 	fmt.Println(pre + in)
@@ -439,20 +476,26 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.appendEntryCh = make(chan struct{}, 100)
 	rf.stopCh = make(chan struct{})
 	rf.electionTimer = time.NewTimer(ElectionTimeout + getRandomTime())
+	// 由于rpc发送存在延迟，因此需要为每个follower设置独立的定时器
+	rf.SendTimer = make([]*time.Timer, len(rf.peers))
+	for i := range rf.peers {
+		rf.SendTimer[i] = time.NewTimer(HeartBeatTimeout)
+	}
 	// initialize from State persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 	// start ticker goroutine to start elections
 	go rf.ticker()
 
 	go func() {
-		for{
+		for {
 			select {
-			case <- rf.stopCh:
+			case <-rf.stopCh:
 				return
-			case <-rf.electionTimer.C:	//无论是选举超时还是心跳超时，都会发起选举
-				go rf.startElection()
+			case <-rf.electionTimer.C: //无论是选举超时还是心跳超时，都会发起选举
+				rf.modifyVoteFor(emptyVotedFor)
+				rf.startElection()
 				rf.resetElectionTimeout()
-			case <-rf.appendEntryCh:	//收到合法的appendEntry(心跳)时
+			case <-rf.appendEntryCh: //收到合法的appendEntry(心跳)时
 				rf.modifyState(Follower)
 				rf.modifyVoteFor(emptyVotedFor)
 				rf.resetElectionTimeout()
@@ -460,10 +503,22 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		}
 	}()
 
-	go func() {
-		// todo for leader to send the heartbeat
-
-	}()
+	// leader
+	for i := range peers {
+		if i == rf.me {
+			continue
+		}
+		go func(i int) {
+			for {
+				select {
+				case <-rf.stopCh:
+					return
+				case <-rf.SendTimer[i].C:
+					rf.sendHeartbeatsToFollower(i)
+				}
+			}
+		}(i)
+	}
 
 	return rf
 }
@@ -480,8 +535,8 @@ func getRandomTime() time.Duration {
 
 func (rf *Raft) startElection() {
 	rf.modifyState(Candidate)
-	nowTerm := rf.currentTerm	// 防止sleep结束后term已经更新
-	time.Sleep((getRandomTime() + 50) * time.Millisecond)
+	nowTerm := rf.currentTerm                                       // 防止sleep结束后term已经更新
+	time.Sleep(getRandomTime()*time.Millisecond + HeartBeatTimeout) // 保证该周期至少可以收到一个心跳
 	if rf.state != Candidate || rf.votedFor != emptyVotedFor || rf.currentTerm != nowTerm {
 		rf.printLog("quit election because %v %v %v", rf.state != Candidate, rf.votedFor != emptyVotedFor, rf.currentTerm != nowTerm)
 		rf.modifyState(Follower)
@@ -519,3 +574,53 @@ func (rf *Raft) startElection() {
 	}
 }
 
+func (rf *Raft) sendHeartbeatsToFollower(i int) {
+	RPCTimer := time.NewTimer(RPCThreshold)
+	defer RPCTimer.Stop()
+
+	for !rf.killed() {
+		rf.lock("callAppendEntries" + strconv.Itoa(i))
+		if rf.state != Leader {
+			rf.resetSendTimer(i)
+			rf.unlock("callAppendEntries" + strconv.Itoa(i))
+			return
+		}
+
+		rf.resetSendTimer(i)
+		rf.unlock("callAppendEntries" + strconv.Itoa(i))
+		ch := make(chan bool, 1)
+		args := AppendEntriesArgs{
+			Term:     rf.currentTerm,
+			LeaderId: rf.me,
+		}
+		reply := AppendEntriesReply{}
+		go func(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+			ok := rf.peers[i].Call("Raft.AppendEntries", args, reply)
+			if !ok {
+				time.Sleep(time.Millisecond * 10)
+			}
+			ch <- ok
+		}(&args, &reply)
+
+		select {
+		case <-rf.stopCh:
+			return
+		case <-RPCTimer.C:
+			rf.printLog("AppendEntries RPC timeout: follower:%d, args:%+v", i, args)
+			continue
+		case ok := <-ch:
+			if !ok {
+				rf.printLog("AppendEntries failed")
+				continue
+			}
+		}
+
+		// todo review reply
+
+	}
+}
+
+func (rf *Raft) resetSendTimer(i int) {
+	rf.SendTimer[i].Stop()
+	rf.SendTimer[i].Reset(HeartBeatTimeout)
+}
