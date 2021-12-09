@@ -20,8 +20,6 @@ package raft
 import (
 	"fmt"
 	"math/rand"
-	"strconv"
-
 	//	"bytes"
 	"sync"
 	"sync/atomic"
@@ -534,6 +532,9 @@ func getRandomTime() time.Duration {
 }
 
 func (rf *Raft) startElection() {
+	if rf.state == Leader {
+		return
+	}
 	rf.modifyState(Candidate)
 	nowTerm := rf.currentTerm                                       // 防止sleep结束后term已经更新
 	time.Sleep(getRandomTime()*time.Millisecond + HeartBeatTimeout) // 保证该周期至少可以收到一个心跳
@@ -545,32 +546,61 @@ func (rf *Raft) startElection() {
 	rf.printLog("join election")
 	rf.modifyTerm(0, true)
 	rf.modifyVoteFor(rf.me)
-	voteNum := 1
+
+	args := RequestVoteArgs{
+		Term:         rf.currentTerm,
+		CandidateId:  rf.me,
+	}
+	ch := make(chan bool, len(rf.peers))
 	for i := range rf.peers {
 		if i == rf.me {
 			continue
 		}
-		args := RequestVoteArgs{
-			Term:        rf.currentTerm,
-			CandidateId: rf.me,
-			// lastLogIndex: 0,// 2A暂时不用
-			// lastLogTerm:  0,
-		}
-		reply := RequestVoteReply{}
-		ok := rf.sendRequestVote(i, &args, &reply)
-		if ok {
-			if reply.VoteGranted {
-				voteNum++
-				rf.printLog("get a vote from peer:%d", i)
+		// 异步发起RequestVote RPC
+		go func(i int) {
+			reply := RequestVoteReply{
+				VoteGranted: false,
 			}
-			if voteNum > len(rf.peers)/2 {
-				// become leader
-				rf.printLog("win the election with voteNum:%d", voteNum)
-				rf.modifyState(Leader)
+			ok := rf.sendRequestVote(i, &args, &reply)
+			ch <- reply.VoteGranted
+			// 如果在投票时出现了Follower term比自己大的情况，则需要做自降Follower操作
+			if ok && reply.Term > args.Term {
+				rf.modifyTerm(reply.Term, false)
+				rf.modifyState(Follower)
 				rf.modifyVoteFor(emptyVotedFor)
-				break
+				rf.resetElectionTimeout()
 			}
+		}(i)
+	}
+
+	replyNum := 1
+	voteNum := 1
+	for {
+		res := <- ch
+		replyNum++
+		if res {
+			voteNum++
 		}
+		if replyNum == len(rf.peers) || voteNum > len(rf.peers)/2 || replyNum - voteNum > len(rf.peers)/2 {
+			break
+		}
+	}
+
+	if voteNum <= len(rf.peers)/2 {
+		rf.printLog("fail in the election because only get voteNum: %d", voteNum)
+		rf.modifyState(Follower)
+		rf.modifyVoteFor(emptyVotedFor)
+		return
+	}
+
+	rf.printLog("try to become leader with voteNum: %d", voteNum)
+	if rf.currentTerm == args.Term && rf.state == Candidate { // 防止其他人已经在新的Term成为leader
+		rf.modifyState(Leader)
+		rf.resetAllSendTimer()
+	} else {
+		rf.printLog("fail to become leader because: %v %v", rf.currentTerm == args.Term, rf.state == Candidate)
+		rf.modifyState(Follower)
+		rf.modifyVoteFor(emptyVotedFor)
 	}
 }
 
@@ -579,15 +609,12 @@ func (rf *Raft) sendHeartbeatsToFollower(i int) {
 	defer RPCTimer.Stop()
 
 	for !rf.killed() {
-		rf.lock("callAppendEntries" + strconv.Itoa(i))
 		if rf.state != Leader {
 			rf.resetSendTimer(i)
-			rf.unlock("callAppendEntries" + strconv.Itoa(i))
 			return
 		}
 
 		rf.resetSendTimer(i)
-		rf.unlock("callAppendEntries" + strconv.Itoa(i))
 		ch := make(chan bool, 1)
 		args := AppendEntriesArgs{
 			Term:     rf.currentTerm,
@@ -615,12 +642,24 @@ func (rf *Raft) sendHeartbeatsToFollower(i int) {
 			}
 		}
 
-		// todo review reply
-
+		if reply.Term > rf.currentTerm {
+			// 	leader 发现自己已经落后于接受者，自降为Follower
+			rf.modifyState(Follower)
+			rf.modifyTerm(reply.Term, false)
+			rf.resetElectionTimeout()
+			return
+		}
+		// todo 2B review reply
 	}
 }
 
 func (rf *Raft) resetSendTimer(i int) {
 	rf.SendTimer[i].Stop()
 	rf.SendTimer[i].Reset(HeartBeatTimeout)
+}
+
+func (rf *Raft) resetAllSendTimer() {
+	for i := range rf.peers {
+		rf.resetSendTimer(i)
+	}
 }
