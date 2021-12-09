@@ -60,31 +60,37 @@ func TestReElection2A(t *testing.T) {
 	leader1 := cfg.checkOneLeader()
 
 	// if the leader disconnects, a new one should be elected.
+	t.Logf("leader%d will offline\n", leader1)
 	cfg.disconnect(leader1)
 	cfg.checkOneLeader()
 
 	// if the old leader rejoins, that shouldn't
 	// disturb the new leader.
+	t.Log("old leader will back\n")
 	cfg.connect(leader1)
 	leader2 := cfg.checkOneLeader()
 
 	// if there's no quorum, no leader should
 	// be elected.
+	t.Log("if there's no quorum, no leader should be elected.\n")
 	cfg.disconnect(leader2)
 	cfg.disconnect((leader2 + 1) % servers)
 	time.Sleep(2 * RaftElectionTimeout)
 	cfg.checkNoLeader()
 
 	// if a quorum arises, it should elect a leader.
+	t.Log("if a quorum arises, it should elect a leader.\n")
 	cfg.connect((leader2 + 1) % servers)
 	cfg.checkOneLeader()
 
 	// re-join of last node shouldn't prevent leader from existing.
+	t.Log("re-join of last node shouldn't prevent leader from existing.\n")
 	cfg.connect(leader2)
 	cfg.checkOneLeader()
 
 	cfg.end()
 }
+
 
 func TestManyElections2A(t *testing.T) {
 	servers := 7
@@ -93,6 +99,7 @@ func TestManyElections2A(t *testing.T) {
 
 	cfg.begin("Test (2A): multiple elections")
 
+	t.Logf("check for election of 7 servers\n")
 	cfg.checkOneLeader()
 
 	iters := 10
@@ -107,13 +114,16 @@ func TestManyElections2A(t *testing.T) {
 
 		// either the current leader should still be alive,
 		// or the remaining four should elect a new one.
+		t.Logf("check for election of 4 servers, disconnect server:%d %d %d\n", i1, i2, i3)
 		cfg.checkOneLeader()
 
 		cfg.connect(i1)
 		cfg.connect(i2)
 		cfg.connect(i3)
+		t.Logf("servers back:%d %d %d\n", i1, i2, i3)
 	}
 
+	t.Logf("check for election of 7 servers\n")
 	cfg.checkOneLeader()
 
 	cfg.end()
