@@ -70,6 +70,7 @@ const (
 	ElectionTimeout        = time.Millisecond * 300
 	RPCThreshold           = time.Millisecond * 50
 	LockThreshold          = time.Millisecond * 10
+	ApplyMsgSendTimeout	   = time.Millisecond * 200
 )
 
 // Raft
@@ -106,7 +107,8 @@ type Raft struct {
 	state         State
 	electionTimer *time.Timer
 	SendTimer     []*time.Timer // leader发起AppendEntries RPC调用计时,如果超时发送一条空的心跳
-	appendEntryCh chan struct{} // 收到合法的appendEntry时才会导入该chan,
+	appendEntryCh chan struct{} // 收到合法的appendEntry时才会导入该chan
+	applyMsgSendTimer *time.Timer
 
 	// lock debug
 	lockName  string
@@ -532,6 +534,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.electionTimer = time.NewTimer(ElectionTimeout + getRandomTime())
 	// 由于rpc发送存在延迟，因此需要为每个follower设置独立的定时器
 	rf.SendTimer = make([]*time.Timer, len(rf.peers))
+	//需要设定一个定期提交的Timer, 使得Leader也可以提交
+	rf.applyMsgSendTimer = time.NewTimer(ApplyMsgSendTimeout)
 	for i := range rf.peers {
 		rf.SendTimer[i] = time.NewTimer(HeartBeatTimeout)
 	}
@@ -555,12 +559,13 @@ func Make(peers []*labrpc.ClientEnd, me int,
 				if rf.state != Follower{
 					rf.modifyState(Follower)
 				}
-				if rf.votedFor != emptyVotedFor{
+				if rf.votedFor != emptyVotedFor {
 					rf.modifyVoteFor(emptyVotedFor)
 				}
-				// todo 给tester发送ApplyMsg
 				rf.sendApplyMsg()
 				rf.resetElectionTimeout()
+				case <- rf.applyMsgSendTimer.C:
+					rf.sendApplyMsg()
 			}
 		}
 	}()
@@ -586,8 +591,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	return rf
 }
 
-// todo 需要设定一个定期提交的Timer, 使得Leader也可以提交
+
 func (rf *Raft) sendApplyMsg() {
+	defer rf.applyMsgSendTimer.Reset(ApplyMsgSendTimeout)
 	// 发送lastApplied到commitIndex之间的Entries
 	msgs := make([]ApplyMsg, 0)
 	rf.lock("sendApplyMsg")
