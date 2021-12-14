@@ -82,6 +82,8 @@ type Raft struct {
 	me        int                 // this peer's index into peers[]
 	dead      int32               // set by Kill()
 
+	applyCh chan ApplyMsg		// send ApplyMsg to tester
+
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// State a Raft server must maintain.
@@ -104,7 +106,7 @@ type Raft struct {
 	state         State
 	electionTimer *time.Timer
 	SendTimer     []*time.Timer // leader发起AppendEntries RPC调用计时,如果超时发送一条空的心跳
-	appendEntryCh chan struct{} // 收到合法的appendEntry时才会导入该chan
+	appendEntryCh chan struct{} // 收到合法的appendEntry时才会导入该chan,
 
 	// lock debug
 	lockName  string
@@ -466,6 +468,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 	// 找到prevLogIndex的位置，将之后的内容直接用args.Entries覆盖，因为prevLogIndex前的内容应该都被确认过
 	if len(args.Entries) > 0 {
+		rf.printLog("%d entries has been add", len(args.Entries))
 		rf.lock("appendLog")
 		rf.log = append(rf.log[:args.PrevLogIndex+1], args.Entries...)
 		rf.unlock("appendLog")
@@ -514,6 +517,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
+	rf.applyCh = applyCh
 	// Your initialization code here (2A, 2B, 2C).
 	rf.currentTerm = 0
 	rf.votedFor = emptyVotedFor
@@ -542,7 +546,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 			case <-rf.stopCh:
 				return
 			case <-rf.electionTimer.C: //无论是选举超时还是心跳超时，都会发起选举
-				rf.modifyVoteFor(emptyVotedFor)
+				if rf.votedFor != emptyVotedFor{
+					rf.modifyVoteFor(emptyVotedFor)
+				}
 				rf.startElection()
 				rf.resetElectionTimeout()
 			case <-rf.appendEntryCh: //收到合法的appendEntry(心跳)时
@@ -552,6 +558,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 				if rf.votedFor != emptyVotedFor{
 					rf.modifyVoteFor(emptyVotedFor)
 				}
+				// todo 给tester发送ApplyMsg
+				rf.sendApplyMsg()
 				rf.resetElectionTimeout()
 			}
 		}
@@ -568,6 +576,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 				case <-rf.stopCh:
 					return
 				case <-rf.SendTimer[i].C:
+					// 检查Leader身份后发送
 					rf.sendAppendEntriesToFollower(i)
 				}
 			}
@@ -575,6 +584,31 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	}
 
 	return rf
+}
+
+// todo 需要设定一个定期提交的Timer, 使得Leader也可以提交
+func (rf *Raft) sendApplyMsg() {
+	// 发送lastApplied到commitIndex之间的Entries
+	msgs := make([]ApplyMsg, 0)
+	rf.lock("sendApplyMsg")
+	if rf.commitIndex > rf.lastApplied {
+		rf.printLog("sent to tester %+v", rf)
+		for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
+			msgs = append(msgs, ApplyMsg{
+				CommandValid: true,
+				Command:      rf.log[i].Command,
+				CommandIndex: i,
+			})
+		}
+	}
+	rf.unlock("sendApplyMsg")
+
+	for _, msg := range msgs {
+		rf.applyCh <- msg
+		rf.lock("modifyLastApplied")
+		rf.lastApplied = msg.CommandIndex
+		rf.unlock("modifyLastApplied")
+	}
 }
 
 func (rf *Raft) resetElectionTimeout() {
@@ -752,9 +786,15 @@ func (rf *Raft) sendAppendEntriesToFollower(i int) {
 						}
 					}
 				}
+				if rf.commitIndex != i {
+					// 后续的不需要再判断
+					break
+				}
 			}
+			return
 		} else {
 			// 发送失败，且不是term落后的情况，则是preLogIndex不匹配，因此需要减少nextIndex的值来重试
+			// todo review this code
 			rf.decreaseNextIndex(i)
 			continue
 		}
@@ -775,9 +815,12 @@ func (rf *Raft) modifyNextIndex(peerIndex, addNum int) {
 
 // 用于在发送失败时重试nextIndex，进行--
 func (rf *Raft) decreaseNextIndex(peerIndex int) {
+	defer rf.unlock("decreaseNextIndex" + strconv.Itoa(peerIndex))
 	rf.lock("decreaseNextIndex" + strconv.Itoa(peerIndex))
+	if rf.nextIndex[peerIndex] <= 0 {
+		return
+	}
 	rf.nextIndex[peerIndex]--
-	rf.unlock("decreaseNextIndex" + strconv.Itoa(peerIndex))
 }
 
 func  (rf *Raft) modifyMatchIndex(peerIndex, addNum int) {
