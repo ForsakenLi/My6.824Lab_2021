@@ -450,6 +450,7 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int  // 当前任期,对于领导者而言 它会更新自己的任期
 	Success bool // 结果为真 如果跟随者所含有的条目和prevLogIndex以及prevLogTerm匹配上了
+	NextIndex int// Follower希望收到的下一个Entries的下标，如果按照论文没有该变量，实现起来有很多麻烦
 }
 
 // AppendEntries leader发起调用：追加日志&&心跳, follower接收
@@ -462,7 +463,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 	if len(rf.log) - 1 < args.PrevLogIndex || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
-		// 无法找到匹配prevLogIndex/Term的logEntry(Receiver_implement 2)
+		// 无法找到匹配的 prevLogIndex/Term 的logEntry(Receiver_implement 2), Leader需要回退其的 nextIndex
 		rf.printLog("can't find prevLogIndex/Term AppendEntries RPC from leader peer:%d, args:%+v", args.LeaderId, args)
 		reply.Success = false
 		reply.Term = rf.currentTerm
@@ -484,6 +485,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.modifyTerm(args.Term, false)
 	rf.appendEntryCh <- struct{}{}
 	reply.Success = true
+	reply.NextIndex = len(rf.log)
 	reply.Term = rf.currentTerm
 
 }
@@ -550,13 +552,13 @@ func Make(peers []*labrpc.ClientEnd, me int,
 			case <-rf.stopCh:
 				return
 			case <-rf.electionTimer.C: //无论是选举超时还是心跳超时，都会发起选举
-				if rf.votedFor != emptyVotedFor{
+				if rf.votedFor != emptyVotedFor {
 					rf.modifyVoteFor(emptyVotedFor)
 				}
 				rf.startElection()
 				rf.resetElectionTimeout()
 			case <-rf.appendEntryCh: //收到合法的appendEntry(心跳)时
-				if rf.state != Follower{
+				if rf.state != Follower {
 					rf.modifyState(Follower)
 				}
 				if rf.votedFor != emptyVotedFor {
@@ -564,8 +566,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 				}
 				rf.sendApplyMsg()
 				rf.resetElectionTimeout()
-				case <- rf.applyMsgSendTimer.C:
-					rf.sendApplyMsg()
+			case <-rf.applyMsgSendTimer.C:	//定期提交ApplyMsg到tester
+				rf.sendApplyMsg()
 			}
 		}
 	}()
@@ -702,8 +704,8 @@ func (rf *Raft) startElection() {
 	}
 }
 
-func (rf *Raft) getAppendEntriesArgs(i int) *AppendEntriesArgs {
-	nextIndex := rf.nextIndex[i]
+func (rf *Raft) getAppendEntriesArgs(followerIdx int) *AppendEntriesArgs {
+	nextIndex := rf.nextIndex[followerIdx]
 	lastIndex := len(rf.log) - 1
 	lastTerm := rf.log[lastIndex].Term
 	entries := make([]LogEntry, 0)
@@ -730,22 +732,22 @@ func (rf *Raft) getAppendEntriesArgs(i int) *AppendEntriesArgs {
 	return &args
 }
 
-func (rf *Raft) sendAppendEntriesToFollower(i int) {
+func (rf *Raft) sendAppendEntriesToFollower(followerIdx int) {
 	RPCTimer := time.NewTimer(RPCThreshold)
 	defer RPCTimer.Stop()
 
 	for !rf.killed() {
 		if rf.state != Leader {
-			rf.resetSendTimer(i)
+			rf.resetSendTimer(followerIdx)
 			return
 		}
 
-		rf.resetSendTimer(i)
+		rf.resetSendTimer(followerIdx)
 		ch := make(chan bool, 1)
-		args := rf.getAppendEntriesArgs(i)
+		args := rf.getAppendEntriesArgs(followerIdx)
 		reply := AppendEntriesReply{}
 		go func(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-			ok := rf.peers[i].Call("Raft.AppendEntries", args, reply)
+			ok := rf.peers[followerIdx].Call("Raft.AppendEntries", args, reply)
 			if !ok {
 				time.Sleep(time.Millisecond * 10)
 			}
@@ -756,7 +758,7 @@ func (rf *Raft) sendAppendEntriesToFollower(i int) {
 		case <-rf.stopCh:
 			return
 		case <-RPCTimer.C:
-			rf.printLog("AppendEntries RPC timeout: follower:%d, args:%+v", i, args)
+			rf.printLog("AppendEntries RPC timeout: follower:%d, args:%+v", followerIdx, args)
 			continue
 		case ok := <-ch:
 			if !ok {
@@ -772,36 +774,52 @@ func (rf *Raft) sendAppendEntriesToFollower(i int) {
 			rf.resetElectionTimeout()
 			return
 		}
+
+		if rf.state != Leader || rf.currentTerm != args.Term {
+			// review state
+			return
+		}
+
 		if reply.Success {
 			// 更新next和matchIndex表示下次该peer的位置
-			if len(args.Entries) > 0 {
-				rf.printLog("append %d entries to follower: %d", len(args.Entries), i)
-				rf.modifyMatchIndex(i, len(args.Entries))
-				rf.modifyNextIndex(i, len(args.Entries))
+			// fixed: TestFailAgree2B无法通过
+			// 这种写法看似正确，但其实会出现在出现故障时matchIndex被重复计算导致元素重复的问题
+			// 主要原因是args.Entries并不一定是从NextIndex位置Append的
+			//if len(args.Entries) > 0 {
+			//	rf.printLog("append %d entries to follower: %d", len(args.Entries), followerIdx)
+			//	rf.modifyMatchIndex(followerIdx, len(args.Entries))
+			//	rf.modifyNextIndex(followerIdx, len(args.Entries))
+			//}
+			// 下面为修改的写法，nextIndex采用reply返回的NextIndex值
+			if reply.NextIndex > rf.nextIndex[followerIdx] {
+				rf.nextIndex[followerIdx] = reply.NextIndex
+				rf.matchIndex[followerIdx] = reply.NextIndex - 1
 			}
 			// 更新commitIndex，只要有一半的peer已经确认该index被复制到该机器上，就可以确认该index被commit
-			for j := rf.commitIndex + 1; j < len(rf.log); j++ {
-				confirmed := 0
-				for _, m := range rf.matchIndex {
-					if m >= j {
-						confirmed++
-						if confirmed > len(rf.peers)/2 {
-							rf.modifyCommitIndex(j)
-							rf.printLog("CommitIndex has been updated to %d", j)
-							break
+			if len(args.Entries) > 0 && args.Entries[len(args.Entries)-1].Term == rf.currentTerm {
+				for j := rf.commitIndex + 1; j < len(rf.log); j++ {
+					confirmed := 0
+					for _, m := range rf.matchIndex {
+						if m >= j {
+							confirmed++
+							if confirmed > len(rf.peers)/2 {
+								rf.modifyCommitIndex(j)
+								rf.printLog("CommitIndex has been updated to %d", j)
+								break
+							}
 						}
 					}
-				}
-				if rf.commitIndex != i {
-					// 后续的不需要再判断
-					break
+					if rf.commitIndex != j {
+						// 后续的不需要再判断
+						break
+					}
 				}
 			}
 			return
 		} else {
 			// 发送失败，且不是term落后的情况，则是preLogIndex不匹配，因此需要减少nextIndex的值来重试
 			// todo review this code
-			rf.decreaseNextIndex(i)
+			rf.decreaseNextIndex(followerIdx)
 			continue
 		}
 	}

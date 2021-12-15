@@ -193,29 +193,38 @@ func TestFailAgree2B(t *testing.T) {
 	defer cfg.cleanup()
 
 	cfg.begin("Test (2B): agreement despite follower disconnection")
-
+	t.Log("Will send 101")
 	cfg.one(101, servers, false)
 
 	// disconnect one follower from the network.
 	leader := cfg.checkOneLeader()
+	t.Logf("Peer %d will disconnect", (leader + 1) % servers)
 	cfg.disconnect((leader + 1) % servers)
 
 	// the leader and remaining follower should be
 	// able to agree despite the disconnected follower.
+	t.Log("Will send 102")
 	cfg.one(102, servers-1, false)
+	t.Log("Will send 103")
 	cfg.one(103, servers-1, false)
+	t.Logf("will sleep")
 	time.Sleep(RaftElectionTimeout)
+	t.Log("Will send 104")
 	cfg.one(104, servers-1, false)
+	t.Log("Will send 105")
 	cfg.one(105, servers-1, false)
 
 	// re-connect
+	t.Logf("Peer %d will reconnect", (leader + 1) % servers)
 	cfg.connect((leader + 1) % servers)
 
 	// the full set of servers should preserve
 	// previous agreements, and be able to agree
 	// on new commands.
+	t.Log("Will send 106")
 	cfg.one(106, servers, true)
 	time.Sleep(RaftElectionTimeout)
+	t.Log("Will send 107")
 	cfg.one(107, servers, true)
 
 	cfg.end()
