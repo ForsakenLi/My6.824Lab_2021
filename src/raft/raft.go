@@ -450,7 +450,7 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int  // 当前任期,对于领导者而言 它会更新自己的任期
 	Success bool // 结果为真 如果跟随者所含有的条目和prevLogIndex以及prevLogTerm匹配上了
-	NextIndex int// Follower希望收到的下一个Entries的下标，如果按照论文没有该变量，实现起来有很多麻烦
+	// NextIndex int// Follower希望收到的下一个Entries的下标，如果按照论文没有该变量，实现起来有很多麻烦
 }
 
 // AppendEntries leader发起调用：追加日志&&心跳, follower接收
@@ -485,7 +485,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.modifyTerm(args.Term, false)
 	rf.appendEntryCh <- struct{}{}
 	reply.Success = true
-	reply.NextIndex = len(rf.log)
+	// reply.NextIndex = len(rf.log)
 	reply.Term = rf.currentTerm
 
 }
@@ -790,11 +790,18 @@ func (rf *Raft) sendAppendEntriesToFollower(followerIdx int) {
 			//	rf.modifyMatchIndex(followerIdx, len(args.Entries))
 			//	rf.modifyNextIndex(followerIdx, len(args.Entries))
 			//}
-			// 下面为修改的写法，nextIndex采用reply返回的NextIndex值
-			if reply.NextIndex > rf.nextIndex[followerIdx] {
-				rf.nextIndex[followerIdx] = reply.NextIndex
-				rf.matchIndex[followerIdx] = reply.NextIndex - 1
+			// 下面为修改的写法，matchIndex直接在args.PrevLogIndex加上len(args.Entries)即可，可以正常通过测试
+			if len(args.Entries) > 0 {
+				rf.printLog("append %d entries to follower: %d", len(args.Entries), followerIdx)
+				rf.lock("modify next and match index")
+				rf.nextIndex[followerIdx] = args.PrevLogIndex + len(args.Entries) + 1
+				rf.matchIndex[followerIdx] = args.PrevLogIndex + len(args.Entries)
+				rf.unlock("modify next and match index")
 			}
+			//if reply.NextIndex > rf.nextIndex[followerIdx] {
+			//	rf.nextIndex[followerIdx] = reply.NextIndex
+			//	rf.matchIndex[followerIdx] = reply.NextIndex - 1
+			//}
 			// 更新commitIndex，只要有一半的peer已经确认该index被复制到该机器上，就可以确认该index被commit
 			if len(args.Entries) > 0 && args.Entries[len(args.Entries)-1].Term == rf.currentTerm {
 				for j := rf.commitIndex + 1; j < len(rf.log); j++ {
