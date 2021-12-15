@@ -1,4 +1,5 @@
 ## My 6.824 Lab 2021 version
+Lab2 link: https://pdos.csail.mit.edu/6.824/labs/lab-raft.html
 
 ### Lab 2A: Leader election
 Checkpoint saved in `branch: Lab_2A_rebuild`.

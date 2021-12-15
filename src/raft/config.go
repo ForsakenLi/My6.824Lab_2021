@@ -430,7 +430,7 @@ func (cfg *config) checkNoLeader() {
 }
 
 // how many servers think a log entry is committed?
-func (cfg *config) nCommitted(index int) (int, interface{}) {
+func (cfg *config)nCommitted(index int) (int, interface{}) {
 	count := 0
 	var cmd interface{} = nil
 	for i := 0; i < len(cfg.rafts); i++ {
