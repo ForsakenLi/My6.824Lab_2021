@@ -664,6 +664,7 @@ func TestPersist22C(t *testing.T) {
 
 		cfg.disconnect((leader1 + 1) % servers)
 		cfg.disconnect((leader1 + 2) % servers)
+		t.Logf("%d %d disconnect", (leader1 + 1) % servers, (leader1 + 2) % servers)
 
 		cfg.one(10+index, servers-2, true)
 		index++
@@ -671,22 +672,24 @@ func TestPersist22C(t *testing.T) {
 		cfg.disconnect((leader1 + 0) % servers)
 		cfg.disconnect((leader1 + 3) % servers)
 		cfg.disconnect((leader1 + 4) % servers)
+		t.Logf("%d %d %d disconnect", (leader1 + 0) % servers, (leader1 + 3) % servers, (leader1 + 4) % servers)
 
 		cfg.start1((leader1+1)%servers, cfg.applier)
 		cfg.start1((leader1+2)%servers, cfg.applier)
 		cfg.connect((leader1 + 1) % servers)
 		cfg.connect((leader1 + 2) % servers)
-
+		t.Logf("%d %d connect", (leader1 + 1) % servers, (leader1 + 2) % servers)
 		time.Sleep(RaftElectionTimeout)
 
 		cfg.start1((leader1+3)%servers, cfg.applier)
 		cfg.connect((leader1 + 3) % servers)
-
+		t.Logf("%d connect", (leader1 + 3) % servers)
 		cfg.one(10+index, servers-2, true)
 		index++
 
 		cfg.connect((leader1 + 4) % servers)
 		cfg.connect((leader1 + 0) % servers)
+		t.Logf("%d %d connect", (leader1 + 4) % servers, (leader1 + 0) % servers)
 	}
 
 	cfg.one(1000, servers, true)
@@ -727,11 +730,11 @@ func TestPersist32C(t *testing.T) {
 //
 // Test the scenarios described in Figure 8 of the extended Raft paper. Each
 // iteration asks a leader, if there is one, to insert a command in the Raft
-// log.  If there is a leader, that leader will fail quickly with a high
+// Log.  If there is a leader, that leader will fail quickly with a high
 // probability (perhaps without committing the command), or crash after a while
 // with low probability (most likey committing the command).  If the number of
 // alive servers isn't enough to form a majority, perhaps start a new server.
-// The leader in a new term may try to finish replicating log entries that
+// The leader in a new term may try to finish replicating Log entries that
 // haven't been committed yet.
 //
 func TestFigure82C(t *testing.T) {
