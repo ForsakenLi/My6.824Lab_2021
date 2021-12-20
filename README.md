@@ -20,3 +20,9 @@ Checkpoint saved in `branch: Lab_2B_Log`.
 prevLogIndex处Append的，如果在成功Append后在reply中加上表示Follower希望的下一个Index，可以便于Leader正确的更新matchIndex和nextIndex参数。~~
 
 当然最好的方法是将matchIndex和nextIndex在PrevLogIndex的基础上加上len(args.Entries), 经过测试，这种方式不需要修改AppendEntries的参数，且可以正常通过全部测试。
+
+### Lab 2C: Persistence
+Checkpoint saved in `branch: Lab_2C_Persistence`.
+
+主要基于6.824助教写的debug文档 https://thesquareplanet.com/blog/students-guide-to-raft/
+进行debug
