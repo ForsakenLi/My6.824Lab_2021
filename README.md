@@ -50,5 +50,17 @@ Checkpoint saved in `branch: Lab_2C_Persistence`.
 
 5. 根据助教写的debug指南, 发现之前的RequestVote存在逻辑漏洞, 例如确定投票给出后, 应该立即重置选举计数器; 如果自己是leader, 则应直接拒绝投票; 如果args中的Term大于自己则无论为什么state都需要自降为Follower, 这些逻辑在之前的代码里没有被if覆盖完整导致出现了问题。
 
+6. 应专门开设一个协程用于发送ApplyMsg到ApplyCh, 同时在发送时获取锁, 保证向ApplyCh发送是完全串行的, 不能将发送ApplyCh功能的协程和发起选举或投票的协程混用, 否则会导致ApplyMsg发送不及时而无法通过测试。
+
 #### Lab2C debug总结
 经过这几天的dubug, 没有想到自己的代码竟然有这么多问题, 过程虽然很痛苦, 但是完成后还是非常有成就感的。其实这个`TestFigure8Unreliable2C`就是一个照妖镜, 之前Lab2a、Lab2b的测试其实很容易就可以通过, 并不能发现代码中存在的问题, `TestFigure8Unreliable2C`主要检测Raft集群能否快速的在网络出现长时间故障, 恢复后能否在10s内达成共识, 且会对刚完成写入的leader进行disconnect, 这个测试可以说是一个比较完整的测试了, 对性能也有一定的要求。我出现的那些问题大部分也不是玄学问题, 基本上就是逻辑漏洞, 写并发代码的能力还需提高。
+
+### Lab 2D: Log compaction
+Checkpoint saved in `branch: Lab_2C_Persistence`.
+
+参考资料：
+
+https://zhuanlan.zhihu.com/p/425615927
+
+https://www.cnblogs.com/sun-lingyu/p/14591757.html
+
