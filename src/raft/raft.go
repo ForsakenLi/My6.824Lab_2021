@@ -212,7 +212,7 @@ func (rf *Raft) getPersistStateBytes() []byte {
 	e.Encode(rf.CurrentTerm)
 	e.Encode(rf.Log)
 	e.Encode(rf.VotedFor)
-	e.Encode(rf.CommitIndex)
+	//e.Encode(rf.CommitIndex)
 	data := w.Bytes()
 	return data
 }
@@ -229,14 +229,15 @@ func (rf *Raft) readPersist(data []byte) {
 	var CurrentTerm int
 	var Log LogBind
 	var VotedFor int
-	var CommitIndex int
-	if d.Decode(&CurrentTerm) != nil || d.Decode(&Log) != nil || d.Decode(&VotedFor) != nil || d.Decode(&CommitIndex) != nil {
+	//var CommitIndex int
+	if d.Decode(&CurrentTerm) != nil || d.Decode(&Log) != nil || d.Decode(&VotedFor) != nil {
+	//|| d.Decode(&CommitIndex) != nil {
 		rf.printLog("Read Persist failed\n")
 	} else {
 		rf.VotedFor = VotedFor
 		rf.CurrentTerm = CurrentTerm
 		rf.Log = Log
-		rf.CommitIndex = CommitIndex
+		//rf.CommitIndex = CommitIndex
 	}
 
 }
@@ -303,6 +304,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.state = Follower
 	}
 	lastLogIndex, lastLogTerm := rf.Log.getLastIndexAndTerm()
+	// todo review this
 	if lastLogTerm > args.LastLogTerm || (args.LastLogTerm == lastLogTerm && args.LastLogIndex < lastLogIndex) {
 		// 必须保证Candidate的Log要新于自己才能投给他
 		reply.Term = rf.CurrentTerm
@@ -494,7 +496,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.NextIndex = rf.Log.LastIncludedIndex + 1
 	} else if args.PrevLogIndex > rf.Log.getLastIndex() {
 		// 缺少中间的部分
-		rf.printLog("can't find prevLogIndex AppendEntries RPC from leader peer:%d, args:%+v", args.LeaderId, args)
+		rf.printLog("can't find prevLogIndex AppendEntries RPC from leader peer:%d, args:%+v, myLog:%+v", args.LeaderId, args, rf.Log)
 		reply.Success = false
 		reply.NextIndex = rf.Log.getLastIndex() + 1
 	} else if args.PrevLogIndex == rf.Log.LastIncludedIndex {
@@ -549,7 +551,8 @@ func min(a, b int) int {
 // 为打印内容增加固定前缀
 func (rf *Raft) printLog(format string, i ...interface{}) {
 	in := fmt.Sprintf(format, i...)
-	pre := fmt.Sprintf("[Peer:%d Term:%d VoteFor:%d]", rf.me, rf.CurrentTerm, rf.VotedFor)
+	pre := fmt.Sprintf("[Peer:%d Term:%d VoteFor:%d LastInclIndex/Term: %d/%d]", rf.me, rf.CurrentTerm,
+		rf.VotedFor, rf.Log.LastIncludedIndex, rf.Log.LastIncludedTerm)
 	fmt.Println(pre + in)
 }
 
@@ -650,7 +653,6 @@ func (rf *Raft) sendApplyMsg() {
 	msgs := make([]ApplyMsg, 0)
 	rf.lock("sendApplyMsg")
 	if rf.CommitIndex > rf.lastApplied && rf.lastApplied >= rf.Log.LastIncludedIndex {
-		rf.printLog("sent to tester %+v", rf)
 		for i := rf.lastApplied + 1; i <= rf.CommitIndex; i++ {
 			msgs = append(msgs, ApplyMsg{
 				CommandValid: true,
@@ -660,7 +662,7 @@ func (rf *Raft) sendApplyMsg() {
 		}
 	}
 	rf.unlock("sendApplyMsg")
-
+	rf.printLog("sent to tester %+v", msgs)
 	for _, msg := range msgs {
 		rf.applyCh <- msg
 		rf.lock("modifyLastApplied")
@@ -798,12 +800,19 @@ func (rf *Raft) getAppendEntriesArgs(followerIdx int) *AppendEntriesArgs {
 		return &args
 	}
 	entries = append(entries, rf.Log.Entries[nextIndex - rf.Log.LastIncludedIndex:]...)
+	prevLogIndex := nextIndex - 1
+	var prevLogTerm int
+	if prevLogIndex == rf.Log.LastIncludedIndex {
+		prevLogTerm = rf.Log.LastIncludedTerm
+	} else {
+		prevLogTerm = rf.Log.get(prevLogIndex).Term
+	}
 	args := AppendEntriesArgs{
 		Term:         rf.CurrentTerm,
 		LeaderId:     rf.me,
 		Entries:      entries,
-		PrevLogIndex: nextIndex - 1,
-		PrevLogTerm:  rf.Log.get(nextIndex - 1).Term,
+		PrevLogIndex: prevLogIndex,
+		PrevLogTerm:  prevLogTerm,
 		LeaderCommit: rf.CommitIndex,
 	}
 	return &args
@@ -923,8 +932,10 @@ func (rf *Raft) sendAppendEntriesToFollower(followerIdx int) {
 			if reply.NextIndex != 0 {
 				if reply.NextIndex > rf.Log.LastIncludedIndex {
 					// 没有出现论文中所说的"远远落后"的情况，更新该peer的nextIndex后重试
+					rf.nextIndex[followerIdx] = reply.NextIndex
 					rf.unlock("handleReplyOfAppendEntries")
-				} else {
+					continue
+				} else if reply.NextIndex < rf.Log.LastIncludedIndex {
 					// 出现论文中所说的"远远落后"的情况，发送InstallSnapshot RPC
 					go rf.sendInstallSnapshotToFollower(followerIdx)
 					rf.unlock("handleReplyOfAppendEntries")

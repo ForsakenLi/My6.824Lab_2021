@@ -17,31 +17,29 @@ type InstallSnapshotReply struct {
 // InstallSnapshot Follow Figure 13
 func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
 	rf.lock("InstallSnapshot")
-	defer rf.unlock("InstallSnapshot")
-
 	if args.Term < rf.CurrentTerm {
 		reply.Term = rf.CurrentTerm
+		rf.unlock("InstallSnapshot")
 		return
 	} else if args.Term > rf.CurrentTerm {
 		rf.CurrentTerm = args.Term
 		rf.state = Follower
-	} else if rf.state != Follower {
-		rf.state = Follower
 	}
 
 	if args.LastIncludedIndex <= rf.Log.LastIncludedIndex {
-		rf.printLog("receive old LastIncludedIndex")
+		rf.printLog("receive old LastIncludedIndex %d", args.LastIncludedIndex)
+		rf.unlock("InstallSnapshot")
 		return
 	}
 	rf.resetElectionTimeout()
-
+	rf.unlock("InstallSnapshot")
 	// 指南中说：当Follower收到并处理 InstallSnapshot RPC 时，它必须使用 Raft 将包含的快照交给服务。InstallSnapshot 处理程序可以使用
 	// applyCh 来将快照发送给服务，方法是将快照放在 ApplyMsg 中。服务从applyCh中读取，并用快照调用CondInstallSnapshot来告诉Raft，
 	// 服务正在切换到传入的快照状态，并且Raft应该同时更新它的日志。(参见config.go中的applierSnap()，看看tester服务是如何做到这一点的)
 
 	// 也就是说，收到InstallSnapshot并不需要Follower修改其自身的日志，仅需要Follower将这个收到这个快照的信息通过applyCh发送给上一层，
 	// 真正修改日志是在CondInstallSnapshot RPC调用之时完成的
-
+	rf.printLog("receive InstallSnapshot with snapIndex/Term %d/%d", args.LastIncludedIndex, args.LastIncludedTerm)
 	applyMsg := ApplyMsg{
 		SnapshotValid: true,
 		Snapshot:      args.Data,
@@ -125,18 +123,20 @@ func (rf *Raft) sendInstallSnapshotToFollower(followerIdx int) {
 // CondInstallSnapshot
 // A service wants to switch to snapshot.  Only do so if Raft hasn't
 // have more recent info since it communicate the snapshot on applyCh.
-//
+// 其实CondInstallSnapshot传入的参数就是在InstallSnapshot中发给applyCh的
 func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int, snapshot []byte) bool {
 
+	rf.printLog("CondInstallSnapshot to lastIncludedTerm: %d; lastIncludedIndex: %d", lastIncludedTerm, lastIncludedIndex)
 	rf.lock("CondInstallSnapshot")
 	defer rf.unlock("CondInstallSnapshot") // defer的顺序是后进先出
 
-	if lastIncludedIndex <= rf.CommitIndex {
+	if lastIncludedIndex <= rf.Log.LastIncludedIndex {
 		// 如果这个快照已经被加载了，就不需要再次载入了
 		return false
 	}
 
 	defer func() {
+		rf.printLog("CondInstallSnapshot finish")
 		rf.Log.LastIncludedIndex = lastIncludedIndex
 		rf.Log.LastIncludedTerm = lastIncludedTerm
 		rf.CommitIndex = lastIncludedIndex
@@ -147,15 +147,18 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 	lastIndex, lastTerm := rf.Log.getLastIndexAndTerm()
 	if lastIncludedIndex <= lastIndex && lastTerm == lastIncludedTerm {
 		// 当该peer的LogEntries比快照点更新时，我们需要保留比快照点更新的部分
-		if lastIncludedIndex > rf.Log.LastIncludedIndex {
-			rf.Log.Entries = append(make([]LogEntry, 1), rf.Log.Entries[lastIncludedIndex-rf.Log.LastIncludedIndex:]...)
-		} else {
-			//do nothing
-		}
+		rf.printLog("[CondInstallSnapshot] entries change before: %+v", rf.Log.Entries)
+		rf.Log.Entries = append(make([]LogEntry, 1), rf.Log.Entries[lastIncludedIndex-rf.Log.LastIncludedIndex:]...)
+		rf.printLog("[CondInstallSnapshot] entries change to: %+v", rf.Log.Entries)
 		return true
 	}
 	//否则就直接清空LogEntries
+	rf.printLog("[CondInstallSnapshot] entries change before: %+v", rf.Log.Entries)
 	rf.Log.Entries = make([]LogEntry, 1)	//保留Log[0]
+	rf.Log.Entries[0] = LogEntry{
+		Term: lastIncludedTerm,
+	}
+	rf.printLog("[CondInstallSnapshot] entries change to: %+v", rf.Log.Entries)
 	return true
 }
 
@@ -172,7 +175,8 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 		//already created a snapshot
 		return
 	}
-	rf.Log.Entries = append(make([]LogEntry, 1), rf.Log.Entries[index-rf.Log.LastIncludedIndex:]...)
+	rf.printLog("snapshot content %s\n", string(snapshot))
+	rf.Log.Entries = append(make([]LogEntry, 0), rf.Log.Entries[index-rf.Log.LastIncludedIndex:]...)
 	rf.Log.LastIncludedIndex = index
 	rf.Log.LastIncludedTerm = rf.Log.get(index).Term
 	rf.persister.SaveStateAndSnapshot(rf.getPersistStateBytes(), snapshot)

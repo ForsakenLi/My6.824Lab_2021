@@ -1033,6 +1033,7 @@ func TestUnreliableChurn2C(t *testing.T) {
 const MAXLOGSIZE = 2000
 
 func snapcommon(t *testing.T, name string, disconnect bool, reliable bool, crash bool) {
+	// todo review this
 	iters := 30
 	servers := 3
 	cfg := make_config(t, servers, !reliable, true)
@@ -1040,9 +1041,10 @@ func snapcommon(t *testing.T, name string, disconnect bool, reliable bool, crash
 
 	cfg.begin(name)
 
+	t.Logf("agreement check\n")
 	cfg.one(rand.Int(), servers, true)
 	leader1 := cfg.checkOneLeader()
-
+	t.Logf("%d become leader\n", leader1)
 	for i := 0; i < iters; i++ {
 		victim := (leader1 + 1) % servers
 		sender := leader1
@@ -1052,16 +1054,22 @@ func snapcommon(t *testing.T, name string, disconnect bool, reliable bool, crash
 		}
 
 		if disconnect {
+			t.Logf("[iter:%d]%d is going to disconnect\n", i, victim)
 			cfg.disconnect(victim)
+			t.Logf("agreement check\n")
 			cfg.one(rand.Int(), servers-1, true)
 		}
 		if crash {
+			t.Logf("[iter:%d]%d is going to crash\n",i, victim)
 			cfg.crash1(victim)
+			t.Logf("agreement check\n")
 			cfg.one(rand.Int(), servers-1, true)
 		}
 		// send enough to get a snapshot
 		for i := 0; i < SnapShotInterval+1; i++ {
-			cfg.rafts[sender].Start(rand.Int())
+			r1 := rand.Int()
+			t.Logf("send command %d\n", r1)
+			cfg.rafts[sender].Start(r1)
 		}
 		// let applier threads catch up with the Start()'s
 		cfg.one(rand.Int(), servers-1, true)
@@ -1072,15 +1080,21 @@ func snapcommon(t *testing.T, name string, disconnect bool, reliable bool, crash
 		if disconnect {
 			// reconnect a follower, who maybe behind and
 			// needs to rceive a snapshot to catch up.
+			t.Logf("[iter:%d]%d is going to reconnect\n", i, victim)
 			cfg.connect(victim)
-			cfg.one(rand.Int(), servers, true)
+			t.Logf("[iter:%d]agreement check\n", i)
+			cfg.one(rand.Int(), servers, true)		// fail in here
 			leader1 = cfg.checkOneLeader()
+			t.Logf("[iter:%d]%d become leader\n",i, leader1)
 		}
 		if crash {
+			t.Logf("[iter:%d]%d is going to reboot\n",i, victim)
 			cfg.start1(victim, cfg.applierSnap)
 			cfg.connect(victim)
+			t.Logf("[iter:%d]agreement check\n", i)
 			cfg.one(rand.Int(), servers, true)
 			leader1 = cfg.checkOneLeader()
+			t.Logf("[iter:%d]%d become leader\n",i, leader1)
 		}
 	}
 	cfg.end()
