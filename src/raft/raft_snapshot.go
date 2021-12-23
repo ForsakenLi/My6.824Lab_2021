@@ -180,7 +180,6 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 		//already created a snapshot
 		return
 	}
-	rf.printLog("snapshot content %s\n", string(snapshot))
 	rf.Log.Entries = append(make([]LogEntry, 0), rf.Log.Entries[index-rf.Log.LastIncludedIndex:]...)
 	rf.Log.LastIncludedIndex = index
 	rf.Log.LastIncludedTerm = rf.Log.get(index).Term

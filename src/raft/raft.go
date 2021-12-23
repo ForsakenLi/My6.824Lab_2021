@@ -212,7 +212,7 @@ func (rf *Raft) getPersistStateBytes() []byte {
 	e.Encode(rf.CurrentTerm)
 	e.Encode(rf.Log)
 	e.Encode(rf.VotedFor)
-	e.Encode(rf.CommitIndex)
+	// e.Encode(rf.CommitIndex)
 	data := w.Bytes()
 	return data
 }
@@ -229,14 +229,15 @@ func (rf *Raft) readPersist(data []byte) {
 	var CurrentTerm int
 	var Log LogBind
 	var VotedFor int
-	var CommitIndex int
-	if d.Decode(&CurrentTerm) != nil || d.Decode(&Log) != nil || d.Decode(&VotedFor) != nil || d.Decode(&CommitIndex) != nil {
+	//var CommitIndex int
+	if d.Decode(&CurrentTerm) != nil || d.Decode(&Log) != nil || d.Decode(&VotedFor) != nil {
+	//|| d.Decode(&CommitIndex) != nil {
 		rf.printLog("Read Persist failed\n")
 	} else {
 		rf.VotedFor = VotedFor
 		rf.CurrentTerm = CurrentTerm
 		rf.Log = Log
-		rf.CommitIndex = CommitIndex
+		//rf.CommitIndex = CommitIndex
 	}
 
 }
@@ -556,8 +557,8 @@ func min(a, b int) int {
 // 为打印内容增加固定前缀
 func (rf *Raft) printLog(format string, i ...interface{}) {
 	in := fmt.Sprintf(format, i...)
-	pre := fmt.Sprintf("[Peer:%d Term:%d VoteFor:%d LastInclIndex/Term: %d/%d]", rf.me, rf.CurrentTerm,
-		rf.VotedFor, rf.Log.LastIncludedIndex, rf.Log.LastIncludedTerm)
+	pre := fmt.Sprintf("[Peer:%d Term:%d LastInclIndex/Term: %d/%d Entries: %+v]\n", rf.me, rf.CurrentTerm,
+		 rf.Log.LastIncludedIndex, rf.Log.LastIncludedTerm, rf.Log.Entries)
 	fmt.Println(pre + in)
 }
 
@@ -604,6 +605,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	}
 	// initialize from State persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
+	rf.lastApplied = rf.Log.LastIncludedIndex
+
+	fmt.Printf("\n%d Make finish %+v\n", rf.me, rf)
 
 	// Apply Log协程
 	go func() {
@@ -657,7 +661,7 @@ func (rf *Raft) sendApplyMsg() {
 	// 发送lastApplied到commitIndex之间的Entries
 	msgs := make([]ApplyMsg, 0)
 	rf.lock("sendApplyMsg")
-	if rf.CommitIndex > rf.lastApplied && rf.lastApplied >= rf.Log.LastIncludedIndex {
+	if rf.CommitIndex > rf.lastApplied {
 		for i := rf.lastApplied + 1; i <= rf.CommitIndex; i++ {
 			msgs = append(msgs, ApplyMsg{
 				CommandValid: true,
