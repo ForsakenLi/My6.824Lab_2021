@@ -58,11 +58,38 @@ Checkpoint saved in `branch: Lab_2C_Persistence`.
 ### Lab 2D: Log compaction
 Checkpoint saved in `branch: Lab_2C_Persistence`.
 
+2D 部分是2021版新加入的，这个部分我花了很多时间才弄清楚Snapshot/InstallSnapshot/CondInstallShot三个RPC具体的含义和处理逻辑，在后文会对整个Raft的内部和外部调用进行整理。
+
+主要Debug过程：
+
+1. TestSnapshotInstall2D无法通过: sendAppendEntriesToFollower函数中忘记在正常的返回时修改跟随者NextIndex。
+
+2. TestSnapshotInstallUnreliable2D无法通过: 在AppendEntries函数中如果reply.NextIndex == rf.Log.LastIncludedIndex, 同样也应该发送InstallSnapshot RPC。
+
+3. TestSnapshotInstallCrash2D无法通过: peer crash从快照恢复后，应将lastApplied修改为LastIncludedIndex，直接置为0可能会导致活锁现象。
+
 参考资料：
 
 https://zhuanlan.zhihu.com/p/425615927
 
 https://www.cnblogs.com/sun-lingyu/p/14591757.html
 
-#### Dec 23:
-出现死锁问题，常常陷入一个循环
+
+### Raft Milestone Review
+
+Function fast review:
+
+1. RequestVote: 内部RPC, 当ElectionTimer超时后, 任何Follower和Candidate都会发起一次选举，即使现在已经在选举Candidate状态也会发起一此新的选举。选举过程中Candidate会向所有人发送RequestVote RPC，在验证Candidate身份(term和index必须不能比自己旧)后，被调用方才会把票投过调用方，并重置自己的选举计时器。
+
+2. AppendEntries: 内部RPC，当属于某个Follower的SendTimer超时后，Leader会根据自己维护的nextIndex切片查找该Follower的nextIndex，将自己所有的在其nextIndex后的logEntries发送给该Follower。AppendEntries被调用方会检查调用方的合法性，如果合法就会重置自己的ElectionTimer,然后会检查发送的entries能否被正确拼接，在找到和prevLogTerm和prevLogIndex匹配的位置才会执行拼接，原先的entries会直接被覆盖。优化后的AppendEntries会返回Follower希望收到的NextIndex，可以帮助Leader快速更新属于该Follower的next和match index, 同时Leader会检查所有Follower的matchIndex，过半数的Follower的matchIndex大于一个值后就将自己commitIndex修改为这个值，确定成功
+   AppendEntries还会冲重置这个Follower的SendTimer。
+
+3. Start: 外部调用，调用方会遍历所有peer，直到找到Leader，调用方会发送一条指令给leader，leader会将该指令加入自己的logEntries。
+
+4. GetState: 外部调用，用于检查集群节点状态。
+
+5. InstallSnapshot: 内部RPC, 当Leader完成对Follower的AppendEntries, 如果这个Follower返回的NextIndex的值小于该Leader的LastIncludedIndex(相当于这个Follower没有达到上一个快照点)，就会给这个Follower发送这个快照。InstallSnapshot接收方并不会立刻装载这个镜像，而是先在ApplyCh中发送将要装载这个镜像的请求给用户服务，真正装载这个快照则是在CondInstallSnapshot被外部调用之后。
+
+6. CondInstallSnapshot: 外部调用，外部服务确认一个镜像可以被装载后，通过发起CondInstallSnapshot调用确认其可以安装这个镜像，这个设计是为了保证镜像切换的原子性，具体原因可以参考https://www.cnblogs.com/sun-lingyu/p/14591757.html。
+
+7. Snapshot: 外部调用，外部服务通过这个调用主动的为一个peer装载一个镜像。
