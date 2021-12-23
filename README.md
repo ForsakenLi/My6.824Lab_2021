@@ -64,3 +64,5 @@ https://zhuanlan.zhihu.com/p/425615927
 
 https://www.cnblogs.com/sun-lingyu/p/14591757.html
 
+#### Dec 23:
+出现死锁问题，常常陷入一个循环

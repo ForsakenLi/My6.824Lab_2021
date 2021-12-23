@@ -1,6 +1,8 @@
 package raft
 
-import "time"
+import (
+	"time"
+)
 
 type InstallSnapshotArgs struct {
 	Term              int
@@ -17,22 +19,21 @@ type InstallSnapshotReply struct {
 // InstallSnapshot Follow Figure 13
 func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
 	rf.lock("InstallSnapshot")
+	defer rf.unlock("InstallSnapshot")
 	if args.Term < rf.CurrentTerm {
 		reply.Term = rf.CurrentTerm
-		rf.unlock("InstallSnapshot")
 		return
-	} else if args.Term > rf.CurrentTerm {
+	} else if args.Term > rf.CurrentTerm || rf.state != Follower {
 		rf.CurrentTerm = args.Term
 		rf.state = Follower
+		rf.resetElectionTimeout()
+		defer rf.persist()
 	}
 
 	if args.LastIncludedIndex <= rf.Log.LastIncludedIndex {
 		rf.printLog("receive old LastIncludedIndex %d", args.LastIncludedIndex)
-		rf.unlock("InstallSnapshot")
 		return
 	}
-	rf.resetElectionTimeout()
-	rf.unlock("InstallSnapshot")
 	// 指南中说：当Follower收到并处理 InstallSnapshot RPC 时，它必须使用 Raft 将包含的快照交给服务。InstallSnapshot 处理程序可以使用
 	// applyCh 来将快照发送给服务，方法是将快照放在 ApplyMsg 中。服务从applyCh中读取，并用快照调用CondInstallSnapshot来告诉Raft，
 	// 服务正在切换到传入的快照状态，并且Raft应该同时更新它的日志。(参见config.go中的applierSnap()，看看tester服务是如何做到这一点的)
@@ -59,9 +60,12 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 // 可以安装这个快照后其才会真正安装，但是Leader此时也应该切换这个Follower的nextIndex到lastIncludedIndex,即使Follower没有收到
 // CondInstallSnapshot也无妨，因为此时AppendEntries返回的Reply同样会纠正这个nextIndex， Follower会再次发送InstallSnapshot RPC
 func (rf *Raft) sendInstallSnapshotToFollower(followerIdx int) {
-	RPCTimer := time.NewTimer(RPCThreshold)
-	defer RPCTimer.Stop()
 	rf.lock("sendInstallSnapshotToFollower")
+	if rf.state != Leader {
+		rf.resetSendTimer(followerIdx)
+		rf.unlock("sendInstallSnapshotToFollower")
+		return
+	}
 	args := InstallSnapshotArgs{
 		Term:              rf.CurrentTerm,
 		LeaderId:          rf.me,
@@ -70,7 +74,8 @@ func (rf *Raft) sendInstallSnapshotToFollower(followerIdx int) {
 		Data:              rf.persister.ReadSnapshot(),
 	}
 	rf.unlock("sendInstallSnapshotToFollower")
-
+	RPCTimer := time.NewTimer(RPCThreshold)
+	defer RPCTimer.Stop()
 	for !rf.killed() {
 		resCh := make(chan bool, 1)
 		reply := InstallSnapshotReply{}

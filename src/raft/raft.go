@@ -212,7 +212,7 @@ func (rf *Raft) getPersistStateBytes() []byte {
 	e.Encode(rf.CurrentTerm)
 	e.Encode(rf.Log)
 	e.Encode(rf.VotedFor)
-	//e.Encode(rf.CommitIndex)
+	e.Encode(rf.CommitIndex)
 	data := w.Bytes()
 	return data
 }
@@ -229,15 +229,14 @@ func (rf *Raft) readPersist(data []byte) {
 	var CurrentTerm int
 	var Log LogBind
 	var VotedFor int
-	//var CommitIndex int
-	if d.Decode(&CurrentTerm) != nil || d.Decode(&Log) != nil || d.Decode(&VotedFor) != nil {
-	//|| d.Decode(&CommitIndex) != nil {
+	var CommitIndex int
+	if d.Decode(&CurrentTerm) != nil || d.Decode(&Log) != nil || d.Decode(&VotedFor) != nil || d.Decode(&CommitIndex) != nil {
 		rf.printLog("Read Persist failed\n")
 	} else {
 		rf.VotedFor = VotedFor
 		rf.CurrentTerm = CurrentTerm
 		rf.Log = Log
-		//rf.CommitIndex = CommitIndex
+		rf.CommitIndex = CommitIndex
 	}
 
 }
@@ -492,6 +491,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.resetElectionTimeout()
 	if args.PrevLogIndex < rf.Log.LastIncludedIndex {
 		// 因为 lastsnapshotindex 应该已经被 apply，正常情况不该发生
+		rf.printLog("lack of middle part before LastIncludedIndex")
 		reply.Success = false
 		reply.NextIndex = rf.Log.LastIncludedIndex + 1
 	} else if args.PrevLogIndex > rf.Log.getLastIndex() {
@@ -502,6 +502,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	} else if args.PrevLogIndex == rf.Log.LastIncludedIndex {
 		// PrevLogIndex就是快照
 		if rf.outOfOrderAppendEntries(args) {
+			rf.printLog("out of order")
 			reply.Success = false
 			reply.NextIndex = 0
 		} else {
@@ -512,6 +513,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	} else if rf.Log.get(args.PrevLogIndex).Term == args.PrevLogTerm {
 		// 正常情况
 		if rf.outOfOrderAppendEntries(args) {
+			rf.printLog("out of order")
 			reply.Success = false
 			reply.NextIndex = 0
 		} else {
@@ -526,7 +528,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Success = false
 		term := rf.Log.get(args.PrevLogIndex).Term
 		idx := args.PrevLogIndex
-		for idx > rf.CommitIndex && rf.Log.get(idx).Term == term {
+		for idx > rf.CommitIndex && rf.Log.get(idx).Term == term && idx > rf.Log.LastIncludedIndex {
 			idx -= 1
 		}
 		reply.NextIndex = idx + 1
@@ -534,8 +536,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	if reply.Success {
 		if rf.CommitIndex < args.LeaderCommit {
+			rf.printLog("some entries add")
 			rf.CommitIndex = args.LeaderCommit
 			rf.needToSendApplyMsgCh <- struct{}{}	// 有缓冲区，不会阻塞
+		} else {
+			rf.printLog("no entries add")
 		}
 	}
 	rf.persist()
@@ -935,7 +940,7 @@ func (rf *Raft) sendAppendEntriesToFollower(followerIdx int) {
 					rf.nextIndex[followerIdx] = reply.NextIndex
 					rf.unlock("handleReplyOfAppendEntries")
 					continue
-				} else if reply.NextIndex < rf.Log.LastIncludedIndex {
+				} else {	// 如果reply.NextIndex == rf.Log.LastIncludedIndex, 同样也应发送快照
 					// 出现论文中所说的"远远落后"的情况，发送InstallSnapshot RPC
 					go rf.sendInstallSnapshotToFollower(followerIdx)
 					rf.unlock("handleReplyOfAppendEntries")
