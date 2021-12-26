@@ -34,6 +34,9 @@ type KVServer struct {
 
 	maxraftstate int // snapshot if log grows this big
 
+	versionMap	map[int]int64	// clientId->its version
+	kvMap	map[string]string
+
 	// Your definitions here.
 }
 
@@ -44,9 +47,20 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	// 只有leader才能有效的发送start
+	_, isLeader := kv.rf.GetState()
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+
+	// 需要通过版本号来确认这个请求是否是重复发送的，如果一个请求被确认append成功，则版本号会++
 }
 
-//
+// Kill
 // the tester calls Kill() when a KVServer instance won't
 // be needed again. for your convenience, we supply
 // code to set rf.dead (without needing a lock),
@@ -67,7 +81,7 @@ func (kv *KVServer) killed() bool {
 	return z == 1
 }
 
-//
+// StartKVServer
 // servers[] contains the ports of the set of
 // servers that will cooperate via Raft to
 // form the fault-tolerant key/value service.
@@ -96,6 +110,19 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	// You may need initialization code here.
-
+	go kv.applyChHandler()
 	return kv
+
+}
+
+// 注意applyCh收到的消息其实是raft确认保存的消息，我们在使用Start方法发送到raft集群后，等待作为的leader
+// 的server在applyCh中返回确认该Op被Commit的消息
+func (kv *KVServer) applyChHandler() {
+	for !kv.killed(){
+		applyMsg := <- kv.applyCh
+		if applyMsg.CommandValid {	//是Op类型的applyMsg
+			op := applyMsg.Command.(Op)
+
+		}
+	}
 }

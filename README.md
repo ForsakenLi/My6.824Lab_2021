@@ -93,3 +93,18 @@ Function fast review:
 6. CondInstallSnapshot: 外部调用，外部服务确认一个镜像可以被装载后，通过发起CondInstallSnapshot调用确认其可以安装这个镜像，这个设计是为了保证镜像切换的原子性，具体原因可以参考https://www.cnblogs.com/sun-lingyu/p/14591757.html。
 
 7. Snapshot: 外部调用，外部服务通过这个调用主动的为一个peer装载一个镜像。
+
+
+## Lab 3: Fault-tolerant Key/Value Service
+
+### Lab 3A: Key/value service without snapshots
+
+还有一些设计没有思考清楚：
+
+1. 实验指南中的请求去重问题
+应该是通过版本号机制解决，靠leader维护一个versionMap，对应每个client发送请求的版本进行维护，在applyCh返回确认后就为其版本号++，但需要解决如何跟踪正在处理中但还没被commit的Op
+
+2. 是否应该在每个server上维护一个kvMap
+每个server都可能成为leader，按理说经过raft投票的leader，其收到的Log应该是最新的状态，每个raft都维护一个kvMap应该可行。问题是这个leader切换的过程应该怎么处理，细节
+   
+
