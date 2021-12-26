@@ -269,8 +269,8 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.lock("RequestVote")
-	defer rf.persist()
 	defer rf.unlock("RequestVote")
+	defer rf.persist()
 	// Your code here (2A, 2B).
 	if args.Term < rf.CurrentTerm {
 		reply.Term = rf.CurrentTerm
@@ -556,10 +556,10 @@ func min(a, b int) int {
 
 // 为打印内容增加固定前缀
 func (rf *Raft) printLog(format string, i ...interface{}) {
-	in := fmt.Sprintf(format, i...)
-	pre := fmt.Sprintf("[Peer:%d Term:%d LastInclIndex/Term: %d/%d Entries: %+v]\n", rf.me, rf.CurrentTerm,
-		 rf.Log.LastIncludedIndex, rf.Log.LastIncludedTerm, rf.Log.Entries)
-	fmt.Println(pre + in)
+	//in := fmt.Sprintf(format, i...)
+	//pre := fmt.Sprintf("[Peer:%d Term:%d LastInclIndex/Term: %d/%d Entries: %+v]\n", rf.me, rf.CurrentTerm,
+	//	 rf.Log.LastIncludedIndex, rf.Log.LastIncludedTerm, rf.Log.Entries)
+	//fmt.Println(pre + in)
 }
 
 // Make
