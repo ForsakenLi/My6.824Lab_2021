@@ -783,6 +783,8 @@ func (rf *Raft) startElection() {
 		rf.modifyState(Leader)
 		rf.persist()
 		rf.resetAllSendTimer()
+		// Lab3A: 发送一条双false的消息表示Leader发生了改变
+		go func() {rf.applyCh <- ApplyMsg{CommandValid: false, SnapshotValid: false}}()
 	} else {
 		rf.printLog("fail to become leader because: %v %v", rf.CurrentTerm == args.Term, rf.state == Candidate)
 		rf.modifyState(Follower)

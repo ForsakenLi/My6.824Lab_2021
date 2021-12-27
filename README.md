@@ -107,4 +107,5 @@ Function fast review:
 2. 是否应该在每个server上维护一个kvMap
 每个server都可能成为leader，按理说经过raft投票的leader，其收到的Log应该是最新的状态，每个raft都维护一个kvMap应该可行。问题是这个leader切换的过程应该怎么处理，细节
    
-
+3. Leader切换机制
+我们应该以何种方式来知道Leader已经发生切换了，因为

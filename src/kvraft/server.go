@@ -4,6 +4,7 @@ import (
 	"6.824/labgob"
 	"6.824/labrpc"
 	"6.824/raft"
+	"go/ast"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -23,6 +24,16 @@ type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	Type    string
+	Key     string
+	Value   string
+	Version int64
+	ID      int
+}
+
+type OpHandlerReply struct {
+	Err   Err
+	Value string
 }
 
 type KVServer struct {
@@ -37,27 +48,78 @@ type KVServer struct {
 	versionMap	map[int]int64	// clientId->its version
 	kvMap	map[string]string
 
-	// Your definitions here.
+	// for handling Op
+	opHandlerChs	map[int]chan OpHandlerReply	// handling index -> chan for wait reply
+
 }
 
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
-	// Your code here.
-}
-
-func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
-	// Your code here.
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 
-	// 只有leader才能有效的发送start
 	_, isLeader := kv.rf.GetState()
 	if !isLeader {
 		reply.Err = ErrWrongLeader
 		return
 	}
 
-	// 需要通过版本号来确认这个请求是否是重复发送的，如果一个请求被确认append成功，则版本号会++
+	newOp := Op{
+		Type: "Get",
+		Key: args.Key,
+	}
+	index, _, _ := kv.rf.Start(newOp)
+
+	kv.opHandlerChs[index] = make(chan OpHandlerReply)
+	kv.mu.Unlock()
+	opHandlerReply := <- kv.opHandlerChs[index]
+	kv.mu.Lock()
+
+	reply.Err = opHandlerReply.Err
+	reply.Value = opHandlerReply.Value
+}
+
+func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	// 只有leader才能有效的发送Start
+	_, isLeader := kv.rf.GetState()
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+
+	// 需要通过版本号来确认这个请求是否是重复发送的，如果一个请求被确认append成功，则版本号才会被修改为args中的
+
+	ver, ok := kv.versionMap[args.ClientID]
+	if !ok {
+		kv.versionMap[args.ClientID] = -1	// 目前还不能直接改为arg.Version，需要等待applyCh返回
+	} else if args.Version <= ver {
+		// 重复请求
+		reply.Err = OK
+		return
+	}
+
+	newOp := Op{
+		Type:    args.Op,
+		Key:     args.Key,
+		Value:   args.Value,
+		Version: args.Version,
+		ID:      args.ClientID,
+	}
+
+	index, _, _ := kv.rf.Start(newOp)
+
+	// 用Channel来和处理applyCh的Handler通信，等待结果完成后即可给客户端返回确认
+
+	kv.opHandlerChs[index] = make(chan OpHandlerReply)
+	kv.mu.Unlock()
+	opHandlerReply := <- kv.opHandlerChs[index]
+	kv.mu.Lock()
+
+	// create reply
+	reply.Err = opHandlerReply.Err
 }
 
 // Kill
@@ -107,6 +169,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	// You may need initialization code here.
 
 	kv.applyCh = make(chan raft.ApplyMsg)
+	kv.opHandlerChs = make(map[int]chan OpHandlerReply)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	// You may need initialization code here.
@@ -117,11 +180,20 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 // 注意applyCh收到的消息其实是raft确认保存的消息，我们在使用Start方法发送到raft集群后，等待作为的leader
 // 的server在applyCh中返回确认该Op被Commit的消息
+// 所有Follower也会维护一个kvMap，因为所有人都会收到相同的ApplyMsg(仅限写的Op,Get的Op Follower直接忽略)
+// 类似Raft的主从复制，不知道从机有没有资格处理Get，但是我认为不行，因为从机无法确定自己的Log是最新的，正确的
+// 做法应该是读和写都由Leader完成
 func (kv *KVServer) applyChHandler() {
 	for !kv.killed(){
 		applyMsg := <- kv.applyCh
 		if applyMsg.CommandValid {	//是Op类型的applyMsg
 			op := applyMsg.Command.(Op)
+
+		} else if applyMsg.SnapshotValid {
+			// todo handle snapshot
+		} else {
+			// I win the election, send a Op to let the old leader know, because we have
+			// to notify it to close its opHandlerChs(it have lost the qualification)
 
 		}
 	}
