@@ -4,7 +4,6 @@ import (
 	"6.824/labgob"
 	"6.824/labrpc"
 	"6.824/raft"
-	"go/ast"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -49,8 +48,8 @@ type KVServer struct {
 	kvMap	map[string]string
 
 	// for handling Op
-	opHandlerChs	map[int]chan OpHandlerReply	// handling index -> chan for wait reply
-
+	opWaitChs map[int]chan OpHandlerReply // handling commitIndex -> chan for wait reply
+	waitOpMap map[int]Op                  // handling commitIndex -> Op(insert by Start())
 }
 
 
@@ -70,9 +69,10 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	}
 	index, _, _ := kv.rf.Start(newOp)
 
-	kv.opHandlerChs[index] = make(chan OpHandlerReply)
+	kv.opWaitChs[index] = make(chan OpHandlerReply)
+	kv.waitOpMap[index] = newOp
 	kv.mu.Unlock()
-	opHandlerReply := <- kv.opHandlerChs[index]
+	opHandlerReply := <- kv.opWaitChs[index]
 	kv.mu.Lock()
 
 	reply.Err = opHandlerReply.Err
@@ -113,9 +113,10 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 
 	// 用Channel来和处理applyCh的Handler通信，等待结果完成后即可给客户端返回确认
 
-	kv.opHandlerChs[index] = make(chan OpHandlerReply)
+	kv.opWaitChs[index] = make(chan OpHandlerReply)
+	kv.waitOpMap[index] = newOp
 	kv.mu.Unlock()
-	opHandlerReply := <- kv.opHandlerChs[index]
+	opHandlerReply := <- kv.opWaitChs[index]
 	kv.mu.Lock()
 
 	// create reply
@@ -169,7 +170,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	// You may need initialization code here.
 
 	kv.applyCh = make(chan raft.ApplyMsg)
-	kv.opHandlerChs = make(map[int]chan OpHandlerReply)
+	kv.opWaitChs = make(map[int]chan OpHandlerReply)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	// You may need initialization code here.
@@ -188,13 +189,56 @@ func (kv *KVServer) applyChHandler() {
 		applyMsg := <- kv.applyCh
 		if applyMsg.CommandValid {	//是Op类型的applyMsg
 			op := applyMsg.Command.(Op)
+			// 对于Leader，Get/Put/Append都需要找到对应这个Op的channel，以返回给接收方确认这个
+			// 请求已经被处理完成
+			// 在这里还有Leader身份判断的问题，如果先前Start写入这个index的Op和ApplyMsg返回的Op
+			// 有所不同，那么说明之前这个cmd我调用Start时没有被写入成功, 其实就是当时我已经不是Raft
+			// 多数派的Leader了，我的LogEntry没有被多数派认可，因此这里ApplyMsg返回的Op和我之前
+			// Start进去的Op不同，此时需要做返回ErrWrongLeader并关闭channel的操作。因此需要
+			// 验证返回的Op和之前Start写入的Op是否相同
+			if op.Type != "LeaderChange" {
+				// 比对waitOpMap确定Leader身份
+				kv.mu.Lock()
+				// update kvMap (everyone)
+				if op.Type == "Put" {
+					kv.kvMap[op.Key] = op.Value
+				} else if op.Type == "Append" {
+					if origin, ok := kv.kvMap[op.Key]; ok {
+						kv.kvMap[op.Key] = origin + op.Value
+					} else {
+						kv.kvMap[op.Key] = op.Value
+					}
+				}
+				startOp := kv.waitOpMap[applyMsg.CommandIndex]
+				_, existCh := kv.opWaitChs[applyMsg.CommandIndex]
+				kv.mu.Unlock()
+				if startOp == op && existCh {
+					var handlerReply OpHandlerReply
+					if op.Type == "Get" {
+						kv.mu.Lock()
+						handlerReply.Value = kv.kvMap[op.Key]
+						kv.mu.Unlock()
+					}
+					handlerReply.Err = OK
 
+				} else {
+					// sent ErrLeader to all ch and close all ch
+
+				}
+			} else {
+				// todo handle LeaderChange
+			}
 		} else if applyMsg.SnapshotValid {
-			// todo handle snapshot
+			// todo handle snapshot Lab_3B
 		} else {
 			// I win the election, send a Op to let the old leader know, because we have
-			// to notify it to close its opHandlerChs(it have lost the qualification)
-
+			// to notify it to close its opWaitChs(it have lost the qualification)
+			newOp := Op{
+				Type: "LeaderChange",
+			}
+			kv.mu.Lock()
+			kv.rf.Start(newOp)
+			kv.mu.Unlock()
 		}
 	}
 }
