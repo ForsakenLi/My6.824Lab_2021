@@ -69,10 +69,11 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	}
 	index, _, _ := kv.rf.Start(newOp)
 
-	kv.opWaitChs[index] = make(chan OpHandlerReply)
+	ch := make(chan OpHandlerReply)
 	kv.waitOpMap[index] = newOp
+	kv.opWaitChs[index] = ch
 	kv.mu.Unlock()
-	opHandlerReply := <- kv.opWaitChs[index]
+	opHandlerReply := <- ch
 	kv.mu.Lock()
 
 	reply.Err = opHandlerReply.Err
@@ -113,10 +114,11 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 
 	// 用Channel来和处理applyCh的Handler通信，等待结果完成后即可给客户端返回确认
 
-	kv.opWaitChs[index] = make(chan OpHandlerReply)
+	ch := make(chan OpHandlerReply)
 	kv.waitOpMap[index] = newOp
+	kv.opWaitChs[index] = ch
 	kv.mu.Unlock()
-	opHandlerReply := <- kv.opWaitChs[index]
+	opHandlerReply := <- ch
 	kv.mu.Lock()
 
 	// create reply
@@ -231,7 +233,7 @@ func (kv *KVServer) applyChHandler() {
 				}
 				// 比对waitOpMap确定Leader身份
 				startOp := kv.waitOpMap[applyMsg.CommandIndex]
-				_, existCh := kv.opWaitChs[applyMsg.CommandIndex]
+				waitCh, existCh := kv.opWaitChs[applyMsg.CommandIndex]
 				kv.mu.Unlock()
 				if startOp == op && existCh {
 					DPrintf("[Peer %d] leader handling Op reply of op %+v\n", kv.me, op)
@@ -251,9 +253,9 @@ func (kv *KVServer) applyChHandler() {
 						handlerReply.Err = OK
 					}
 					// sent to wait chan
-					kv.opWaitChs[applyMsg.CommandIndex] <- handlerReply
+					waitCh <- handlerReply
 					// close channel and delete the index from waitMap
-					close(kv.opWaitChs[applyMsg.CommandIndex])
+					close(waitCh)
 					kv.mu.Lock()
 					delete(kv.opWaitChs, applyMsg.CommandIndex)
 					delete(kv.waitOpMap, applyMsg.CommandIndex)
@@ -263,17 +265,14 @@ func (kv *KVServer) applyChHandler() {
 					kv.mu.Lock()
 					if len(kv.opWaitChs) > 0 {
 						DPrintf("[Peer %d] sent ErrLeader to all ch and close all ch\n", kv.me)
+						for index, ch := range kv.opWaitChs {
+							ch <- OpHandlerReply{ErrWrongLeader, ""} // 理论上这里不会被阻塞，Op发起方应该在等待其返回
+							close(ch)
+							delete(kv.opWaitChs, index)
+							delete(kv.waitOpMap, index)
+						}
 					}
 					kv.mu.Unlock()
-					for index, ch := range kv.opWaitChs {
-						ch <- OpHandlerReply{ErrWrongLeader, ""}
-						close(ch)
-						kv.mu.Lock()
-						delete(kv.opWaitChs, index)
-						delete(kv.waitOpMap, index)
-						kv.mu.Unlock()
-
-					}
 				}
 			} else {
 				// op.Type == "LeaderChange"
