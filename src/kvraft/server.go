@@ -9,7 +9,7 @@ import (
 	"sync/atomic"
 )
 
-const Debug = false
+const Debug = true
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug {
@@ -174,6 +174,11 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	// You may need initialization code here.
+	kv.kvMap = make(map[string]string)
+	kv.opWaitChs = make(map[int]chan OpHandlerReply)
+	kv.waitOpMap = make(map[int]Op)
+	kv.versionMap = make(map[int]int64)
+
 	go kv.applyChHandler()
 	return kv
 
@@ -197,46 +202,109 @@ func (kv *KVServer) applyChHandler() {
 			// Start进去的Op不同，此时需要做返回ErrWrongLeader并关闭channel的操作。因此需要
 			// 验证返回的Op和之前Start写入的Op是否相同
 			if op.Type != "LeaderChange" {
-				// 比对waitOpMap确定Leader身份
 				kv.mu.Lock()
-				// update kvMap (everyone)
-				if op.Type == "Put" {
-					kv.kvMap[op.Key] = op.Value
-				} else if op.Type == "Append" {
-					if origin, ok := kv.kvMap[op.Key]; ok {
-						kv.kvMap[op.Key] = origin + op.Value
-					} else {
-						kv.kvMap[op.Key] = op.Value
+				// check version to avoid duplicate Op, and update version (everyone)
+				isDupOp := false
+				if op.Type != "Get" {
+					_, exist := kv.versionMap[op.ID]
+					if !exist {
+						// new Op
+						kv.versionMap[op.ID] = -1
+					}
+					if op.Version <= kv.versionMap[op.ID] {
+						DPrintf("[Peer %d]receive duplicate op:%+v", kv.me, op)
+						isDupOp = true
 					}
 				}
+				// update kvMap (everyone)
+				if !isDupOp {
+					kv.versionMap[op.ID] = op.Version
+					if op.Type == "Put" {
+						kv.kvMap[op.Key] = op.Value
+					} else if op.Type == "Append" {
+						if origin, ok := kv.kvMap[op.Key]; ok {
+							kv.kvMap[op.Key] = origin + op.Value
+						} else {
+							kv.kvMap[op.Key] = op.Value
+						}
+					}
+				}
+				// 比对waitOpMap确定Leader身份
 				startOp := kv.waitOpMap[applyMsg.CommandIndex]
 				_, existCh := kv.opWaitChs[applyMsg.CommandIndex]
 				kv.mu.Unlock()
 				if startOp == op && existCh {
+					DPrintf("[Peer %d] leader handling Op reply of op %+v\n", kv.me, op)
 					var handlerReply OpHandlerReply
 					if op.Type == "Get" {
 						kv.mu.Lock()
-						handlerReply.Value = kv.kvMap[op.Key]
+						value, existKey := kv.kvMap[op.Key]
 						kv.mu.Unlock()
+						if existKey {
+							handlerReply.Value = value
+							handlerReply.Err = OK
+						} else {
+							handlerReply.Err = ErrNoKey
+						}
+					} else {
+						//op.Type == "Put"/"Append"
+						handlerReply.Err = OK
 					}
-					handlerReply.Err = OK
-
+					// sent to wait chan
+					kv.opWaitChs[applyMsg.CommandIndex] <- handlerReply
+					// close channel and delete the index from waitMap
+					close(kv.opWaitChs[applyMsg.CommandIndex])
+					kv.mu.Lock()
+					delete(kv.opWaitChs, applyMsg.CommandIndex)
+					delete(kv.waitOpMap, applyMsg.CommandIndex)
+					kv.mu.Unlock()
 				} else {
 					// sent ErrLeader to all ch and close all ch
+					kv.mu.Lock()
+					if len(kv.opWaitChs) > 0 {
+						DPrintf("[Peer %d] sent ErrLeader to all ch and close all ch\n", kv.me)
+					}
+					kv.mu.Unlock()
+					for index, ch := range kv.opWaitChs {
+						ch <- OpHandlerReply{ErrWrongLeader, ""}
+						close(ch)
+						kv.mu.Lock()
+						delete(kv.opWaitChs, index)
+						delete(kv.waitOpMap, index)
+						kv.mu.Unlock()
 
+					}
 				}
 			} else {
-				// todo handle LeaderChange
+				// op.Type == "LeaderChange"
+				kv.mu.Lock()
+				if op.ID == kv.me {	// ignore this Op
+					kv.mu.Unlock()
+					continue
+				}
+				if len(kv.opWaitChs) > 0 {
+					DPrintf("[Peer %d] receive new Leader ApplyMsg, close all ch\n", kv.me)
+				}
+				kv.mu.Unlock()
+				for index, ch := range kv.opWaitChs {
+					ch <- OpHandlerReply{ErrWrongLeader, ""}
+					close(ch)
+					kv.mu.Lock()
+					delete(kv.opWaitChs, index)
+					delete(kv.waitOpMap, index)
+					kv.mu.Unlock()
+				}
 			}
 		} else if applyMsg.SnapshotValid {
 			// todo handle snapshot Lab_3B
 		} else {
 			// I win the election, send a Op to let the old leader know, because we have
 			// to notify it to close its opWaitChs(it have lost the qualification)
+			kv.mu.Lock()
 			newOp := Op{
 				Type: "LeaderChange",
+				ID: kv.me,	// 如果我收到这条消息，则不需要做推出chan的处理
 			}
-			kv.mu.Lock()
 			kv.rf.Start(newOp)
 			kv.mu.Unlock()
 		}
