@@ -109,3 +109,7 @@ Function fast review:
    
 3. Leader切换机制
 我们应该以何种方式来知道Leader已经发生切换了，因为
+   
+性能优化(For SpeedTest3A)
+
+目前可以确定的有AppendEntries调用的执行时间为1ms左右，应该对性能影响不大

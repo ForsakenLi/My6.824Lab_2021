@@ -90,11 +90,11 @@ const (
 	Follower            State = 0
 	Candidate           State = 1
 	Leader              State = 2
-	HeartBeatTimeout          = time.Millisecond * 150
+	HeartBeatTimeout          = time.Millisecond * 200
 	ElectionTimeout           = time.Millisecond * 300
 	RPCThreshold              = time.Millisecond * 50
 	LockThreshold             = time.Millisecond * 1
-	ApplyMsgSendTimeout       = time.Millisecond * 100
+	ApplyMsgSendTimeout       = time.Millisecond * 800
 )
 
 // Raft
@@ -422,7 +422,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		rf.matchIndex[rf.me] = index
 		rf.persist()
 	}
-	rf.resetAllSendTimer()
+	//rf.resetAllSendTimer()
 	rf.unlock("start")
 	return index, term, isLeader
 }
@@ -554,10 +554,10 @@ func min(a, b int) int {
 
 // 为打印内容增加固定前缀
 func (rf *Raft) printLog(format string, i ...interface{}) {
-	//in := fmt.Sprintf(format, i...)
-	//pre := fmt.Sprintf("[Peer:%d Term:%d LastInclIndex/Term: %d/%d Entries: %+v]\n", rf.me, rf.CurrentTerm,
-	//	 rf.Log.LastIncludedIndex, rf.Log.LastIncludedTerm, rf.Log.Entries)
-	//fmt.Println(pre + in)
+	in := fmt.Sprintf(format, i...)
+	pre := fmt.Sprintf("[Peer:%d Term:%d LastInclIndex/Term: %d/%d]\n", rf.me, rf.CurrentTerm,
+		 rf.Log.LastIncludedIndex, rf.Log.LastIncludedTerm)
+	fmt.Println(pre + in)
 }
 
 // Make
