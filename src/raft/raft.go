@@ -90,11 +90,11 @@ const (
 	Follower            State = 0
 	Candidate           State = 1
 	Leader              State = 2
-	HeartBeatTimeout          = time.Millisecond * 150
+	HeartBeatTimeout          = time.Millisecond * 200
 	ElectionTimeout           = time.Millisecond * 300
 	RPCThreshold              = time.Millisecond * 50
 	LockThreshold             = time.Millisecond * 10
-	ApplyMsgSendTimeout       = time.Millisecond * 100
+	ApplyMsgSendTimeout       = time.Millisecond * 200
 )
 
 // Raft
@@ -143,6 +143,9 @@ type Raft struct {
 	lockEnd   time.Time
 
 	stopCh chan struct{}
+
+	// 立即发送AppendEntriesRPC，以加速上游Server
+	immediatelySendCh	[]chan struct{}
 }
 
 // GetState return CurrentTerm and whether this server
@@ -159,8 +162,6 @@ func (rf *Raft) GetState() (int, bool) {
 	return term, isleader
 }
 
-// 对rf具体值的修改尽量使用modify原语，降低锁的粒度
-// for pre-job to change state
 func (rf *Raft) modifyState(s State) {
 	rf.state = s
 	switch s {
@@ -191,7 +192,7 @@ func (rf *Raft) unlock(name string) {
 	rf.lockName = ""
 	duration := rf.lockEnd.Sub(rf.lockStart)
 	if duration > LockThreshold {
-		rf.printLog("long lock: %s, time: %s", name, duration)
+		fmt.Printf("long lock: %s, time: %s\n", name, duration)
 	}
 	rf.mu.Unlock()
 }
@@ -424,8 +425,14 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		rf.matchIndex[rf.me] = index
 		rf.persist()
 	}
-	rf.resetAllSendTimer()
+	//rf.resetAllSendTimer()
 	rf.unlock("start")
+	go func(){
+		for i := range rf.peers {
+			rf.immediatelySendCh[i] <- struct{}{}
+		}
+	}()
+
 	return index, term, isLeader
 }
 
@@ -557,8 +564,8 @@ func min(a, b int) int {
 // 为打印内容增加固定前缀
 func (rf *Raft) printLog(format string, i ...interface{}) {
 	//in := fmt.Sprintf(format, i...)
-	//pre := fmt.Sprintf("[Peer:%d Term:%d LastInclIndex/Term: %d/%d Entries: %+v]\n", rf.me, rf.CurrentTerm,
-	//	 rf.Log.LastIncludedIndex, rf.Log.LastIncludedTerm, rf.Log.Entries)
+	//pre := fmt.Sprintf("[Peer:%d Term:%d LastInclIndex/Term: %d/%d]\n", rf.me, rf.CurrentTerm,
+	//	 rf.Log.LastIncludedIndex, rf.Log.LastIncludedTerm)
 	//fmt.Println(pre + in)
 }
 
@@ -595,6 +602,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.mu = sync.Mutex{}
 	rf.stopCh = make(chan struct{})
 	rf.needToSendApplyMsgCh = make(chan struct{}, 100)
+
 	rf.electionTimer = time.NewTimer(ElectionTimeout + getRandomTime())
 	// 由于rpc发送存在延迟，因此需要为每个follower设置独立的定时器
 	rf.SendTimer = make([]*time.Timer, len(rf.peers))
@@ -609,6 +617,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	fmt.Printf("\n%d Make finish %+v\n", rf.me, rf)
 
+	rf.immediatelySendCh = make([]chan struct{}, len(rf.peers))
+	for i := range rf.peers {
+		rf.immediatelySendCh[i] = make(chan struct{}, 10)
+	}
 	// Apply Log协程
 	go func() {
 		for {
@@ -616,7 +628,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 			case <-rf.stopCh:
 				return
 			case <-rf.applyMsgSendTimer.C: //定期提交ApplyMsg到tester
-				rf.sendApplyMsg()
+				rf.needToSendApplyMsgCh <- struct{}{}
 			case <-rf.needToSendApplyMsgCh:
 				rf.sendApplyMsg()
 			}
@@ -647,6 +659,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 					return
 				case <-rf.SendTimer[i].C:
 					// 检查Leader身份后发送
+					rf.sendAppendEntriesToFollower(i)
+				case <-rf.immediatelySendCh[i]:
 					rf.sendAppendEntriesToFollower(i)
 				}
 			}
@@ -704,18 +718,6 @@ func (rf *Raft) startElection() {
 	rf.VotedFor = emptyVotedFor
 	rf.modifyState(Candidate)
 	rf.unlock("startElection")
-
-	//nowTerm := rf.CurrentTerm
-	//// 防止sleep结束后term已经更新
-	//rf.unlock("startElection")
-	//time.Sleep(getRandomTime()*time.Millisecond + RPCThreshold) // 保证该周期至少可以收到一个心跳
-	//rf.lock("joinElection")
-	//if rf.state != Candidate || rf.VotedFor != emptyVotedFor || rf.CurrentTerm != nowTerm {
-	//	rf.printLog("quit election because %v %v %v", rf.state != Candidate, rf.VotedFor != emptyVotedFor, rf.CurrentTerm != nowTerm)
-	//	rf.modifyState(Follower)
-	//	rf.unlock("joinElection")
-	//	return
-	//}
 	rf.lock("joinElection")
 	rf.printLog("join election")
 	rf.CurrentTerm++
@@ -783,6 +785,8 @@ func (rf *Raft) startElection() {
 		rf.modifyState(Leader)
 		rf.persist()
 		rf.resetAllSendTimer()
+		// Lab3A: 发送一条双false的消息表示Leader发生了改变
+		go func() {rf.applyCh <- ApplyMsg{CommandValid: false, SnapshotValid: false}}()
 	} else {
 		rf.printLog("fail to become leader because: %v %v", rf.CurrentTerm == args.Term, rf.state == Candidate)
 		rf.modifyState(Follower)
