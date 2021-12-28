@@ -93,7 +93,7 @@ const (
 	HeartBeatTimeout          = time.Millisecond * 150
 	ElectionTimeout           = time.Millisecond * 300
 	RPCThreshold              = time.Millisecond * 50
-	LockThreshold             = time.Millisecond * 10
+	LockThreshold             = time.Millisecond * 1
 	ApplyMsgSendTimeout       = time.Millisecond * 100
 )
 
@@ -159,8 +159,6 @@ func (rf *Raft) GetState() (int, bool) {
 	return term, isleader
 }
 
-// 对rf具体值的修改尽量使用modify原语，降低锁的粒度
-// for pre-job to change state
 func (rf *Raft) modifyState(s State) {
 	rf.state = s
 	switch s {
@@ -191,7 +189,7 @@ func (rf *Raft) unlock(name string) {
 	rf.lockName = ""
 	duration := rf.lockEnd.Sub(rf.lockStart)
 	if duration > LockThreshold {
-		rf.printLog("long lock: %s, time: %s", name, duration)
+		fmt.Printf("long lock: %s, time: %s\n", name, duration)
 	}
 	rf.mu.Unlock()
 }
@@ -594,7 +592,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.matchIndex = make([]int, 0)
 	rf.mu = sync.Mutex{}
 	rf.stopCh = make(chan struct{})
-	rf.needToSendApplyMsgCh = make(chan struct{}, 100)
+	rf.needToSendApplyMsgCh = make(chan struct{}, 1000)
 	rf.electionTimer = time.NewTimer(ElectionTimeout + getRandomTime())
 	// 由于rpc发送存在延迟，因此需要为每个follower设置独立的定时器
 	rf.SendTimer = make([]*time.Timer, len(rf.peers))

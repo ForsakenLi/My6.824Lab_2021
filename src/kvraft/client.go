@@ -92,7 +92,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	for i := 0; ; i++ {
 		reply := PutAppendReply{}
 		nowTryServer := (i + ck.lastServer) % len(ck.servers)
-		ok := ck.servers[(i+ck.lastServer)%len(ck.servers)].Call("KVServer.PutAppend", &args, &reply)
+		ok := ck.servers[nowTryServer].Call("KVServer.PutAppend", &args, &reply)
 
 		if ok {
 			switch reply.Err {
@@ -101,12 +101,13 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 				ck.lastServer = nowTryServer
 				return
 			case ErrNoKey:
-				// impossible
+				ck.lastServer = nowTryServer
+				return
 			case ErrWrongLeader:
 				if i != 0 && i % len(ck.servers) == 0 {
 					// 试了一圈还没有找到，可能是正在选主，sleep一下再试(外部应该是异步调用的Get，不会阻塞外部)
 					DPrintf("[Clerk %d] put %s->%s fail, still trying to find leader", ck.ID, key, value)
-					time.Sleep(10 * time.Millisecond)
+					time.Sleep(200 * time.Millisecond)
 				}
 				continue
 			}

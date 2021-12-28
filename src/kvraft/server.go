@@ -4,9 +4,11 @@ import (
 	"6.824/labgob"
 	"6.824/labrpc"
 	"6.824/raft"
+	"fmt"
 	"log"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 const Debug = true
@@ -50,12 +52,17 @@ type KVServer struct {
 	// for handling Op
 	opWaitChs map[int]chan OpHandlerReply // handling commitIndex -> chan for wait reply
 	waitOpMap map[int]Op                  // handling commitIndex -> Op(insert by Start())
+
+	// lock debug
+	lockName  string
+	lockStart time.Time
+	lockEnd   time.Time
 }
 
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
-	kv.mu.Lock()
-	defer kv.mu.Unlock()
+	kv.lock("Get")
+	defer kv.unlock("Get")
 
 	_, isLeader := kv.rf.GetState()
 	if !isLeader {
@@ -72,17 +79,17 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	ch := make(chan OpHandlerReply)
 	kv.waitOpMap[index] = newOp
 	kv.opWaitChs[index] = ch
-	kv.mu.Unlock()
+	kv.unlock("Get")
 	opHandlerReply := <- ch
-	kv.mu.Lock()
+	kv.lock("Get")
 
 	reply.Err = opHandlerReply.Err
 	reply.Value = opHandlerReply.Value
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
-	kv.mu.Lock()
-	defer kv.mu.Unlock()
+	kv.lock("PutAppend")
+	defer kv.unlock("PutAppend")
 
 	// 只有leader才能有效的发送Start
 	_, isLeader := kv.rf.GetState()
@@ -117,9 +124,9 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	ch := make(chan OpHandlerReply)
 	kv.waitOpMap[index] = newOp
 	kv.opWaitChs[index] = ch
-	kv.mu.Unlock()
+	kv.unlock("PutAppend")
 	opHandlerReply := <- ch
-	kv.mu.Lock()
+	kv.lock("PutAppend")
 
 	// create reply
 	reply.Err = opHandlerReply.Err
@@ -204,7 +211,7 @@ func (kv *KVServer) applyChHandler() {
 			// Start进去的Op不同，此时需要做返回ErrWrongLeader并关闭channel的操作。因此需要
 			// 验证返回的Op和之前Start写入的Op是否相同
 			if op.Type != "LeaderChange" {
-				kv.mu.Lock()
+				kv.lock("RegularOp")
 				// check version to avoid duplicate Op, and update version (everyone)
 				isDupOp := false
 				if op.Type != "Get" {
@@ -234,14 +241,14 @@ func (kv *KVServer) applyChHandler() {
 				// 比对waitOpMap确定Leader身份
 				startOp := kv.waitOpMap[applyMsg.CommandIndex]
 				waitCh, existCh := kv.opWaitChs[applyMsg.CommandIndex]
-				kv.mu.Unlock()
+				//kv.unlock()
 				if startOp == op && existCh {
 					DPrintf("[Peer %d] leader handling Op reply of op %+v\n", kv.me, op)
 					var handlerReply OpHandlerReply
 					if op.Type == "Get" {
-						kv.mu.Lock()
+						//kv.lock()
 						value, existKey := kv.kvMap[op.Key]
-						kv.mu.Unlock()
+						//kv.unlock()
 						if existKey {
 							handlerReply.Value = value
 							handlerReply.Err = OK
@@ -256,13 +263,13 @@ func (kv *KVServer) applyChHandler() {
 					waitCh <- handlerReply
 					// close channel and delete the index from waitMap
 					close(waitCh)
-					kv.mu.Lock()
+					//kv.lock()
 					delete(kv.opWaitChs, applyMsg.CommandIndex)
 					delete(kv.waitOpMap, applyMsg.CommandIndex)
-					kv.mu.Unlock()
+					//kv.unlock()
 				} else {
 					// sent ErrLeader to all ch and close all ch
-					kv.mu.Lock()
+					//kv.lock()
 					if len(kv.opWaitChs) > 0 {
 						DPrintf("[Peer %d] sent ErrLeader to all ch and close all ch\n", kv.me)
 						for index, ch := range kv.opWaitChs {
@@ -272,40 +279,57 @@ func (kv *KVServer) applyChHandler() {
 							delete(kv.waitOpMap, index)
 						}
 					}
-					kv.mu.Unlock()
 				}
+				kv.unlock("RegularOp")
 			} else {
 				// op.Type == "LeaderChange"
-				kv.mu.Lock()
+				kv.lock("LeaderChangeHandle")
 				if op.ID == kv.me {	// ignore this Op
-					kv.mu.Unlock()
+					kv.unlock("LeaderChangeHandle")
 					continue
 				}
 				if len(kv.opWaitChs) > 0 {
 					DPrintf("[Peer %d] receive new Leader ApplyMsg, close all ch\n", kv.me)
 				}
-				kv.mu.Unlock()
+				//kv.unlock()
 				for index, ch := range kv.opWaitChs {
 					ch <- OpHandlerReply{ErrWrongLeader, ""}
 					close(ch)
-					kv.mu.Lock()
+					//kv.lock()
 					delete(kv.opWaitChs, index)
 					delete(kv.waitOpMap, index)
-					kv.mu.Unlock()
+					//kv.unlock()
 				}
+				kv.unlock("LeaderChangeHandle")
 			}
 		} else if applyMsg.SnapshotValid {
 			// todo handle snapshot Lab_3B
 		} else {
 			// I win the election, send a Op to let the old leader know, because we have
 			// to notify it to close its opWaitChs(it have lost the qualification)
-			kv.mu.Lock()
+			kv.lock("LeaderChange")
 			newOp := Op{
 				Type: "LeaderChange",
 				ID: kv.me,	// 如果我收到这条消息，则不需要做推出chan的处理
 			}
 			kv.rf.Start(newOp)
-			kv.mu.Unlock()
+			kv.unlock("LeaderChange")
 		}
 	}
+}
+
+func (kv *KVServer) lock(name string) {
+	kv.mu.Lock()
+	kv.lockStart = time.Now()
+	kv.lockName = name
+}
+
+func (kv *KVServer) unlock(name string) {
+	kv.lockEnd = time.Now()
+	kv.lockName = ""
+	duration := kv.lockEnd.Sub(kv.lockStart)
+	if duration > 1 * time.Millisecond {
+		fmt.Printf("long lock: %s, time: %s\n", name, duration)
+	}
+	kv.mu.Unlock()
 }
