@@ -93,7 +93,7 @@ const (
 	HeartBeatTimeout          = time.Millisecond * 200
 	ElectionTimeout           = time.Millisecond * 300
 	RPCThreshold              = time.Millisecond * 50
-	LockThreshold             = time.Millisecond * 1	//Lock会变成饥饿状态
+	LockThreshold             = time.Millisecond * 10
 	ApplyMsgSendTimeout       = time.Millisecond * 200
 )
 
@@ -563,10 +563,10 @@ func min(a, b int) int {
 
 // 为打印内容增加固定前缀
 func (rf *Raft) printLog(format string, i ...interface{}) {
-	in := fmt.Sprintf(format, i...)
-	pre := fmt.Sprintf("[Peer:%d Term:%d LastInclIndex/Term: %d/%d]\n", rf.me, rf.CurrentTerm,
-		 rf.Log.LastIncludedIndex, rf.Log.LastIncludedTerm)
-	fmt.Println(pre + in)
+	//in := fmt.Sprintf(format, i...)
+	//pre := fmt.Sprintf("[Peer:%d Term:%d LastInclIndex/Term: %d/%d]\n", rf.me, rf.CurrentTerm,
+	//	 rf.Log.LastIncludedIndex, rf.Log.LastIncludedTerm)
+	//fmt.Println(pre + in)
 }
 
 // Make

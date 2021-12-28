@@ -11,7 +11,7 @@ import (
 	"time"
 )
 
-const Debug = true
+const Debug = false
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug {
@@ -328,7 +328,7 @@ func (kv *KVServer) unlock(name string) {
 	kv.lockEnd = time.Now()
 	kv.lockName = ""
 	duration := kv.lockEnd.Sub(kv.lockStart)
-	if duration > 1 * time.Millisecond {
+	if duration > 10 * time.Millisecond {
 		fmt.Printf("long lock: %s, time: %s\n", name, duration)
 	}
 	kv.mu.Unlock()

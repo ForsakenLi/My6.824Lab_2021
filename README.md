@@ -81,8 +81,7 @@ Function fast review:
 
 1. RequestVote: 内部RPC, 当ElectionTimer超时后, 任何Follower和Candidate都会发起一次选举，即使现在已经在选举Candidate状态也会发起一此新的选举。选举过程中Candidate会向所有人发送RequestVote RPC，在验证Candidate身份(term和index必须不能比自己旧)后，被调用方才会把票投过调用方，并重置自己的选举计时器。
 
-2. AppendEntries: 内部RPC，当属于某个Follower的SendTimer超时后，Leader会根据自己维护的nextIndex切片查找该Follower的nextIndex，将自己所有的在其nextIndex后的logEntries发送给该Follower。AppendEntries被调用方会检查调用方的合法性，如果合法就会重置自己的ElectionTimer,然后会检查发送的entries能否被正确拼接，在找到和prevLogTerm和prevLogIndex匹配的位置才会执行拼接，原先的entries会直接被覆盖。优化后的AppendEntries会返回Follower希望收到的NextIndex，可以帮助Leader快速更新属于该Follower的next和match index, 同时Leader会检查所有Follower的matchIndex，过半数的Follower的matchIndex大于一个值后就将自己commitIndex修改为这个值，确定成功
-   AppendEntries还会冲重置这个Follower的SendTimer。
+2. AppendEntries: 内部RPC，当属于某个Follower的SendTimer超时后，Leader会根据自己维护的nextIndex切片查找该Follower的nextIndex，将自己所有的在其nextIndex后的logEntries发送给该Follower。AppendEntries被调用方会检查调用方的合法性，如果合法就会重置自己的ElectionTimer,然后会检查发送的entries能否被正确拼接，在找到和prevLogTerm和prevLogIndex匹配的位置才会执行拼接，原先的entries会直接被覆盖。优化后的AppendEntries会返回Follower希望收到的NextIndex，可以帮助Leader快速更新属于该Follower的next和match index, 同时Leader会检查所有Follower的matchIndex，过半数的Follower的matchIndex大于一个值后就将自己commitIndex修改为这个值，确定成功后AppendEntries还会重置这个Follower的SendTimer。
 
 3. Start: 外部调用，调用方会遍历所有peer，直到找到Leader，调用方会发送一条指令给leader，leader会将该指令加入自己的logEntries。
 
@@ -99,17 +98,16 @@ Function fast review:
 
 ### Lab 3A: Key/value service without snapshots
 
-还有一些设计没有思考清楚：
+Checkpoint saved in `branch: Lab_3A_KV_WIO_Snapshots`.
 
-1. 实验指南中的请求去重问题
-应该是通过版本号机制解决，靠leader维护一个versionMap，对应每个client发送请求的版本进行维护，在applyCh返回确认后就为其版本号++，但需要解决如何跟踪正在处理中但还没被commit的Op
+#### 主要设计思路
 
-2. 是否应该在每个server上维护一个kvMap
-每个server都可能成为leader，按理说经过raft投票的leader，其收到的Log应该是最新的状态，每个raft都维护一个kvMap应该可行。问题是这个leader切换的过程应该怎么处理，细节
-   
-3. Leader切换机制
-我们应该以何种方式来知道Leader已经发生切换了，因为
-   
-性能优化(For SpeedTest3A)
+使用Raft作为底层来完成kvServer, 集群里的每台机器都维护一个kvMap，但仅由Leader响应Client的Get/Put/Append, 集群的非Leader机器仅通过applyCh返回的Op(相当于已经被Leader Commit过)来维护自己的kvMap, 因此无论是Leader还是Follower都需要使用一个协程来处理Raft层applyCh返回的数据。作为Leader的kvServer同时还会维护多个waitCh，用于给Get/Put/Append等RPC回传Operation结果，这些RPC在从waitCh收到Operation结果后才会给Client返回结果。
 
-目前可以确定的有AppendEntries调用的执行时间为1ms左右，应该对性能影响不大
+#### 请求去重
+
+通过版本号机制解决，针对每一个ClientID，我们在一个Map里保存属于该Client的收到的请求的最大版本号。请求去重主要通过两个位置拦截，一个是Leader Server端的Get/Put/Append RPC内(因为正常情况非Leader会直接返回ErrWrongLeader)，通过我们维护的versionMap来保证不会收到重复的请求。另一个地方是在响应applyCh的协程里，在我们根据收到的Op数据修改我们的kvMap前，同样需要检验该Op的Version是否大于之前保存的该ClientID对应的版本号，这是为了防止由于某些特殊的网络故障导致重复的Op被发送到Raft中，版本号仅会在Op成功执行后才会被更新。
+
+#### 性能优化(For SpeedTest3A)
+
+2021版的6.824的Lab 3新加入了一个针对本实验的kv的性能测试，要求平均读写(写一条然后读取)时间小于33ms，这个测试我花了几乎一天时间性能调优才通过。我发现在运行时测试时CPU的占用率很低，说明瓶颈是由于某些同步原语等待导致的。我使用了golang的pprof工具来查找问题，可以通过在go test后加上参数`-bench=. -blockprofile=block.prof -mutexprofile=mutex.prof`来生成性能评估文件，block.prof是阻塞等待的时间消耗而mutex.prof是锁的时间消耗，我们可以使用`go tool pprof -http=:8080 block.prof`来以图形化的方式打开这些性能评估文件，可以清晰的显示每行代码的时间消耗。评估显示我们的代码在等待发送AppendEntries的计时器超时处花了非常久，这个SpeedTest3A是一个串行的测试，只有确定写入操作成功完成并可以读出后(需要等待这个Op被半数以上commit)才会发送下一条指令，这个指令等待被AppendEntries发送到其他Follower的时间(之前的设计是等待心跳计时器超时才会发送)就是我们的瓶颈所在。我通过在写入Raft的入口方法Start处加入一个channel来通知Leader一条指令被写入，负责向其他Follower发送AppendEntries的协程收到channel通知后会立刻发送AppendEntries。经过这个修改，我的读写延迟降低为了1ms左右，SpeedTest3A的1000条读写指令对仅需要1.3s。
