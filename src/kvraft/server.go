@@ -4,6 +4,7 @@ import (
 	"6.824/labgob"
 	"6.824/labrpc"
 	"6.824/raft"
+	"bytes"
 	"fmt"
 	"log"
 	"sync"
@@ -57,6 +58,8 @@ type KVServer struct {
 	lockName  string
 	lockStart time.Time
 	lockEnd   time.Time
+
+	persister *raft.Persister
 }
 
 
@@ -175,6 +178,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv := new(KVServer)
 	kv.me = me
 	kv.maxraftstate = maxraftstate
+	kv.persister = persister
 
 	// You may need initialization code here.
 
@@ -187,6 +191,8 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.opWaitChs = make(map[int]chan OpHandlerReply)
 	kv.waitOpMap = make(map[int]Op)
 	kv.versionMap = make(map[int]int64)
+
+	kv.readPersist(persister.ReadSnapshot())
 
 	go kv.applyChHandler()
 	return kv
@@ -202,6 +208,9 @@ func (kv *KVServer) applyChHandler() {
 	for !kv.killed(){
 		applyMsg := <- kv.applyCh
 		if applyMsg.CommandValid {	//是Op类型的applyMsg
+			if applyMsg.Command == nil {
+				continue
+			}
 			op := applyMsg.Command.(Op)
 			// 对于Leader，Get/Put/Append都需要找到对应这个Op的channel，以返回给接收方确认这个
 			// 请求已经被处理完成
@@ -280,6 +289,9 @@ func (kv *KVServer) applyChHandler() {
 						}
 					}
 				}
+				if kv.maxraftstate != -1 && float32(kv.persister.RaftStateSize()) > float32(kv.maxraftstate)*0.9 {
+					kv.rf.Snapshot(applyMsg.CommandIndex, kv.getPersistStateBytes())
+				}
 				kv.unlock("RegularOp")
 			} else {
 				// op.Type == "LeaderChange"
@@ -303,7 +315,9 @@ func (kv *KVServer) applyChHandler() {
 				kv.unlock("LeaderChangeHandle")
 			}
 		} else if applyMsg.SnapshotValid {
-			// todo handle snapshot Lab_3B
+			if kv.rf.CondInstallSnapshot(applyMsg.SnapshotTerm, applyMsg.SnapshotIndex, applyMsg.Snapshot) {
+				kv.readPersist(applyMsg.Snapshot)
+			}
 		} else {
 			// I win the election, send a Op to let the old leader know, because we have
 			// to notify it to close its opWaitChs(it have lost the qualification)
@@ -332,4 +346,30 @@ func (kv *KVServer) unlock(name string) {
 		fmt.Printf("long lock: %s, time: %s\n", name, duration)
 	}
 	kv.mu.Unlock()
+}
+
+func (kv *KVServer) getPersistStateBytes() []byte {
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(kv.versionMap)
+	e.Encode(kv.kvMap)
+	data := w.Bytes()
+	return data
+}
+
+func (kv *KVServer) readPersist(data []byte) {
+	if data == nil || len(data) < 1 {
+		return
+	}
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var versionMap map[int]int64
+	var kvMap map[string]string
+	if d.Decode(&versionMap) != nil ||
+		d.Decode(&kvMap) != nil {
+		fmt.Printf("server %d readPersist(kv): decode error!", kv.me)
+	} else {
+		kv.versionMap = versionMap
+		kv.kvMap = kvMap
+	}
 }
