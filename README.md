@@ -58,7 +58,7 @@ Checkpoint saved in `branch: Lab_2C_Persistence`.
 ### Lab 2D: Log compaction
 Checkpoint saved in `branch: Lab_2C_Persistence`.
 
-2D 部分是2021版新加入的，这个部分我花了很多时间才弄清楚Snapshot/InstallSnapshot/CondInstallShot三个RPC具体的含义和处理逻辑，在后文会对整个Raft的内部和外部调用进行整理。
+2D 部分是2021版新加入的, 这个部分我花了很多时间才弄清楚Snapshot/InstallSnapshot/CondInstallShot三个RPC具体的含义和处理逻辑, 在后文会对整个Raft的内部和外部调用进行整理。
 
 主要Debug过程：
 
@@ -66,7 +66,7 @@ Checkpoint saved in `branch: Lab_2C_Persistence`.
 
 2. TestSnapshotInstallUnreliable2D无法通过: 在AppendEntries函数中如果reply.NextIndex == rf.Log.LastIncludedIndex, 同样也应该发送InstallSnapshot RPC。
 
-3. TestSnapshotInstallCrash2D无法通过: peer crash从快照恢复后，应将lastApplied修改为LastIncludedIndex，直接置为0可能会导致活锁现象。
+3. TestSnapshotInstallCrash2D无法通过: peer crash从快照恢复后, 应将lastApplied修改为LastIncludedIndex, 直接置为0可能会导致活锁现象。
 
 参考资料：
 
@@ -79,19 +79,19 @@ https://www.cnblogs.com/sun-lingyu/p/14591757.html
 
 Function fast review:
 
-1. RequestVote: 内部RPC, 当ElectionTimer超时后, 任何Follower和Candidate都会发起一次选举，即使现在已经在选举Candidate状态也会发起一此新的选举。选举过程中Candidate会向所有人发送RequestVote RPC，在验证Candidate身份(term和index必须不能比自己旧)后，被调用方才会把票投过调用方，并重置自己的选举计时器。
+1. RequestVote: 内部RPC, 当ElectionTimer超时后, 任何Follower和Candidate都会发起一次选举, 即使现在已经在选举Candidate状态也会发起一此新的选举。选举过程中Candidate会向所有人发送RequestVote RPC, 在验证Candidate身份(term和index必须不能比自己旧)后, 被调用方才会把票投过调用方, 并重置自己的选举计时器。
 
-2. AppendEntries: 内部RPC，当属于某个Follower的SendTimer超时后，Leader会根据自己维护的nextIndex切片查找该Follower的nextIndex，将自己所有的在其nextIndex后的logEntries发送给该Follower。AppendEntries被调用方会检查调用方的合法性，如果合法就会重置自己的ElectionTimer,然后会检查发送的entries能否被正确拼接，在找到和prevLogTerm和prevLogIndex匹配的位置才会执行拼接，原先的entries会直接被覆盖。优化后的AppendEntries会返回Follower希望收到的NextIndex，可以帮助Leader快速更新属于该Follower的next和match index, 同时Leader会检查所有Follower的matchIndex，过半数的Follower的matchIndex大于一个值后就将自己commitIndex修改为这个值，确定成功后AppendEntries还会重置这个Follower的SendTimer。
+2. AppendEntries: 内部RPC, 当属于某个Follower的SendTimer超时后, Leader会根据自己维护的nextIndex切片查找该Follower的nextIndex, 将自己所有的在其nextIndex后的logEntries发送给该Follower。AppendEntries被调用方会检查调用方的合法性, 如果合法就会重置自己的ElectionTimer,然后会检查发送的entries能否被正确拼接, 在找到和prevLogTerm和prevLogIndex匹配的位置才会执行拼接, 原先的entries会直接被覆盖。优化后的AppendEntries会返回Follower希望收到的NextIndex, 可以帮助Leader快速更新属于该Follower的next和match index, 同时Leader会检查所有Follower的matchIndex, 过半数的Follower的matchIndex大于一个值后就将自己commitIndex修改为这个值, 确定成功后AppendEntries还会重置这个Follower的SendTimer。
 
-3. Start: 外部调用，调用方会遍历所有peer，直到找到Leader，调用方会发送一条指令给leader，leader会将该指令加入自己的logEntries。
+3. Start: 外部调用, 调用方会遍历所有peer, 直到找到Leader, 调用方会发送一条指令给leader, leader会将该指令加入自己的logEntries。
 
-4. GetState: 外部调用，用于检查集群节点状态。
+4. GetState: 外部调用, 用于检查集群节点状态。
 
-5. InstallSnapshot: 内部RPC, 当Leader完成对Follower的AppendEntries, 如果这个Follower返回的NextIndex的值小于该Leader的LastIncludedIndex(相当于这个Follower没有达到上一个快照点)，就会给这个Follower发送这个快照。InstallSnapshot接收方并不会立刻装载这个镜像，而是先在ApplyCh中发送将要装载这个镜像的请求给用户服务，真正装载这个快照则是在CondInstallSnapshot被外部调用之后。
+5. InstallSnapshot: 内部RPC, 当Leader完成对Follower的AppendEntries, 如果这个Follower返回的NextIndex的值小于该Leader的LastIncludedIndex(相当于这个Follower没有达到上一个快照点), 就会给这个Follower发送这个快照。InstallSnapshot接收方并不会立刻装载这个镜像, 而是先在ApplyCh中发送将要装载这个镜像的请求给用户服务, 真正装载这个快照则是在CondInstallSnapshot被外部调用之后。
 
-6. CondInstallSnapshot: 外部调用，外部服务确认一个镜像可以被装载后，通过发起CondInstallSnapshot调用确认其可以安装这个镜像，这个设计是为了保证镜像切换的原子性，具体原因可以参考https://www.cnblogs.com/sun-lingyu/p/14591757.html。
+6. CondInstallSnapshot: 外部调用, 外部Server层确认一个镜像可以被装载后, 也就是从applyCh中收到Snapshot请求后, 通过发起CondInstallSnapshot调用确认Raft层可以安装这个镜像。
 
-7. Snapshot: 外部调用，外部服务通过这个调用主动的为一个peer装载一个镜像。
+7. Snapshot: 外部调用, 当Server层希望创建一个镜像时, 会通过这个调用告诉Raft层希望快照的index, 并会将Server层和Raft层的所有需要保存的数据一并存入persister。
 
 
 ## Lab 3: Fault-tolerant Key/Value Service
@@ -102,12 +102,16 @@ Checkpoint saved in `branch: Lab_3A_KV_WIO_Snapshots`.
 
 #### 主要设计思路
 
-使用Raft作为底层来完成kvServer, 集群里的每台机器都维护一个kvMap，但仅由Leader响应Client的Get/Put/Append, 集群的非Leader机器仅通过applyCh返回的Op(相当于已经被Leader Commit过)来维护自己的kvMap, 因此无论是Leader还是Follower都需要使用一个协程来处理Raft层applyCh返回的数据。作为Leader的kvServer同时还会维护多个waitCh，用于给Get/Put/Append等RPC回传Operation结果，这些RPC在从waitCh收到Operation结果后才会给Client返回结果。
+使用Raft作为底层来完成kvServer, 集群里的每台机器都维护一个kvMap, 但仅由Leader响应Client的Get/Put/Append, 集群的非Leader机器仅通过applyCh返回的Op(相当于已经被Leader Commit过)来维护自己的kvMap, 因此无论是Leader还是Follower都需要使用一个协程来处理Raft层applyCh返回的数据。作为Leader的kvServer同时还会维护多个waitCh, 用于给Get/Put/Append等RPC回传Operation结果, 这些RPC在从waitCh收到Operation结果后才会给Client返回结果。
 
 #### 请求去重
 
-通过版本号机制解决，针对每一个ClientID，我们在一个Map里保存属于该Client的收到的请求的最大版本号。请求去重主要通过两个位置拦截，一个是Leader Server端的Get/Put/Append RPC内(因为正常情况非Leader会直接返回ErrWrongLeader)，通过我们维护的versionMap来保证不会收到重复的请求。另一个地方是在响应applyCh的协程里，在我们根据收到的Op数据修改我们的kvMap前，同样需要检验该Op的Version是否大于之前保存的该ClientID对应的版本号，这是为了防止由于某些特殊的网络故障导致重复的Op被发送到Raft中，版本号仅会在Op成功执行后才会被更新。
+通过版本号机制解决, 针对每一个ClientID, 我们在一个Map里保存属于该Client的收到的请求的最大版本号。请求去重主要通过两个位置拦截, 一个是Leader Server端的Get/Put/Append RPC内(因为正常情况非Leader会直接返回ErrWrongLeader), 通过我们维护的versionMap来保证不会收到重复的请求。另一个地方是在响应applyCh的协程里, 在我们根据收到的Op数据修改我们的kvMap前, 同样需要检验该Op的Version是否大于之前保存的该ClientID对应的版本号, 这是为了防止由于某些特殊的网络故障导致重复的Op被发送到Raft中, 版本号仅会在Op成功执行后才会被更新。
 
 #### 性能优化(For SpeedTest3A)
 
-2021版的6.824的Lab 3新加入了一个针对本实验的kv的性能测试，要求平均读写(写一条然后读取)时间小于33ms，这个测试我花了几乎一天时间性能调优才通过。我发现在运行时测试时CPU的占用率很低，说明瓶颈是由于某些同步原语等待导致的。我使用了golang的pprof工具来查找问题，可以通过在go test后加上参数`-bench=. -blockprofile=block.prof -mutexprofile=mutex.prof`来生成性能评估文件，block.prof是阻塞等待的时间消耗而mutex.prof是锁的时间消耗，我们可以使用`go tool pprof -http=:8080 block.prof`来以图形化的方式打开这些性能评估文件，可以清晰的显示每行代码的时间消耗。评估显示我们的代码在等待发送AppendEntries的计时器超时处花了非常久，这个SpeedTest3A是一个串行的测试，只有确定写入操作成功完成并可以读出后(需要等待这个Op被半数以上commit)才会发送下一条指令，这个指令等待被AppendEntries发送到其他Follower的时间(之前的设计是等待心跳计时器超时才会发送)就是我们的瓶颈所在。我通过在写入Raft的入口方法Start处加入一个channel来通知Leader一条指令被写入，负责向其他Follower发送AppendEntries的协程收到channel通知后会立刻发送AppendEntries。经过这个修改，我的读写延迟降低为了1ms左右，SpeedTest3A的1000条读写指令对仅需要1.3s。
+2021版的6.824的Lab 3新加入了一个针对本实验的kv的性能测试, 要求平均读写(写一条然后读取)时间小于33ms, 这个测试我花了几乎一天时间性能调优才通过。我发现在运行时测试时CPU的占用率很低, 说明瓶颈是由于某些同步原语等待导致的。我使用了golang的pprof工具来查找问题, 可以通过在go test后加上参数`-bench=. -blockprofile=block.prof -mutexprofile=mutex.prof`来生成性能评估文件, block.prof是阻塞等待的时间消耗而mutex.prof是锁的时间消耗, 我们可以使用`go tool pprof -http=:8080 block.prof`来以图形化的方式打开这些性能评估文件, 可以清晰的显示每行代码的时间消耗。评估显示我们的代码在等待发送AppendEntries的计时器超时处花了非常久, 这个SpeedTest3A是一个串行的测试, 只有确定写入操作成功完成并可以读出后(需要等待这个Op被半数以上commit)才会发送下一条指令, 这个指令等待被AppendEntries发送到其他Follower的时间(之前的设计是等待心跳计时器超时才会发送)就是我们的瓶颈所在。我通过在写入Raft的入口方法Start处加入一个channel来通知Leader一条指令被写入, 负责向其他Follower发送AppendEntries的协程收到channel通知后会立刻发送AppendEntries。经过这个修改, 我的读写延迟降低为了1ms左右, SpeedTest3A的1000条读写指令对仅需要1.3s。
+
+### Lab 3B: Key/value service with snapshots
+
+本轮实验较为容易, 加上了一个对Raft状态大小的判定, 如果当前的状态超过设定的阈值Server层就会发起一个Snapshot调用；对于落后于快照的peer, 则需要通过InstallSnapshot调用为其安装当前Leader的快照(和2D部分相同), 该peer会向applyCh发送一个snapshot请求, Server层收到该请求后向raft层发起CondInstallSnapshot调用, raft层就会安装该Snapshot。
