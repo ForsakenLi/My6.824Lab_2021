@@ -115,3 +115,9 @@ Checkpoint saved in `branch: Lab_3A_KV_WIO_Snapshots`.
 ### Lab 3B: Key/value service with snapshots
 
 本轮实验较为容易, 加上了一个对Raft状态大小的判定, 如果当前的状态超过设定的阈值Server层就会发起一个Snapshot调用；对于落后于快照的peer, 则需要通过InstallSnapshot调用为其安装当前Leader的快照(和2D部分相同), 该peer会向applyCh发送一个snapshot请求, Server层收到该请求后向raft层发起CondInstallSnapshot调用, raft层就会安装该Snapshot。
+
+## Lab 4: Sharded Key/Value Service
+
+### Lab 4A: The Shard controller
+
+本论实验的coding难度不高，有了Lab3的基础基本上可以很顺利的完成。主要思路是在每台机器上维护相同的config状态机，需要注意的一点是在shard需要重新balance的时候，我们需要找一台目前已经被分配的shard最少的gid, 这时我们需要使用一个map来记录每个gid当前已经被分配了多少个shard，在寻找最少的那个gid时，我们不能简单的随意取一个值最小的，因为golang的map在迭代时顺序是被刻意打乱的，在每台机器上访问的顺序都不一致，如果我们只是选择值最小的gid，那么在每台机器上选择的gid可能会不一致，导致最终各台机器上的状态不一致。所以我们在选择gid时需要加上一个条件，即值一致时选择gid更小的那一个，这样就可以保证在不同机器上选择的gid也是一样的了。
