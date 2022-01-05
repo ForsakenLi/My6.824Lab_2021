@@ -4,7 +4,10 @@ package shardctrler
 // Shardctrler clerk.
 //
 
-import "6.824/labrpc"
+import (
+	"6.824/labrpc"
+	"fmt"
+)
 import "time"
 import "crypto/rand"
 import "math/big"
@@ -42,10 +45,11 @@ func (ck *Clerk) Query(num int) Config {
 	args.ClientID = ck.ID
 	for {
 		// try each known server.
-		for _, srv := range ck.servers {
+		for i, srv := range ck.servers {
 			var reply QueryReply
 			ok := srv.Call("ShardCtrler.Query", args, &reply)
 			if ok && reply.WrongLeader == false {
+				fmt.Printf("[Peer %d] return %+v\n", i, reply)
 				return reply.Config
 			}
 		}

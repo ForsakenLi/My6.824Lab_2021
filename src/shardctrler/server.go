@@ -4,8 +4,6 @@ import (
 	"6.824/raft"
 	"bytes"
 	"encoding/gob"
-	"encoding/json"
-	"fmt"
 	"math"
 	"sync/atomic"
 	"time"
@@ -63,6 +61,7 @@ func (sc *ShardCtrler) Join(args *JoinArgs, reply *JoinReply) {
 	} else if args.Version <= ver {
 		// 重复请求
 		reply.Err = OK
+		sc.unlock("Join")
 		return
 	}
 
@@ -82,7 +81,7 @@ func (sc *ShardCtrler) Join(args *JoinArgs, reply *JoinReply) {
 	opHandlerReply := <-ch
 
 	if joinReply, ok := opHandlerReply.(JoinReply); ok {
-		reply = &joinReply
+		deepCopy(reply, &joinReply)
 	} else {
 		panic("get error type reply")
 	}
@@ -106,6 +105,7 @@ func (sc *ShardCtrler) Leave(args *LeaveArgs, reply *LeaveReply) {
 	} else if args.Version <= ver {
 		// 重复请求
 		reply.Err = OK
+		sc.unlock("Leave")
 		return
 	}
 
@@ -125,7 +125,7 @@ func (sc *ShardCtrler) Leave(args *LeaveArgs, reply *LeaveReply) {
 	opHandlerReply := <-ch
 
 	if leaveReply, ok := opHandlerReply.(LeaveReply); ok {
-		reply = &leaveReply
+		deepCopy(reply, &leaveReply)
 	} else {
 		panic("get error type reply")
 	}
@@ -149,6 +149,7 @@ func (sc *ShardCtrler) Move(args *MoveArgs, reply *MoveReply) {
 	} else if args.Version <= ver {
 		// 重复请求
 		reply.Err = OK
+		sc.unlock("Move")
 		return
 	}
 
@@ -168,7 +169,7 @@ func (sc *ShardCtrler) Move(args *MoveArgs, reply *MoveReply) {
 	opHandlerReply := <-ch
 
 	if moveReply, ok := opHandlerReply.(MoveReply); ok {
-		reply = &moveReply
+		deepCopy(reply, &moveReply)
 	} else {
 		panic("get error type reply")
 	}
@@ -202,11 +203,14 @@ func (sc *ShardCtrler) Query(args *QueryArgs, reply *QueryReply) {
 	opHandlerReply := <-ch
 
 	if queryReply, ok := opHandlerReply.(QueryReply); ok {
-		reply = &queryReply
+		deepCopy(reply, &queryReply)
+		//reply = &queryReply
+		//fmt.Printf("[Peer %d] query reply %+v\n", sc.me, queryReply)
+		//fmt.Printf("index:%d test inside: %+v\n", index, reply)
 	} else {
 		panic("get error type reply")
 	}
-
+	//fmt.Printf("index:%d test outside: %+v\n", index, reply)
 }
 
 // Kill
@@ -267,6 +271,7 @@ func (sc *ShardCtrler) applyChHandler() {
 			op := applyMsg.Command.(Op)
 			if op.Type != "LeaderChange" {
 				sc.lock("RegularOp")
+
 				if op.Type != "Query" {
 					isDupOp := false
 					_, exist := sc.versionMap[op.ID]
@@ -275,10 +280,11 @@ func (sc *ShardCtrler) applyChHandler() {
 						sc.versionMap[op.ID] = -1
 					}
 					if op.Version <= sc.versionMap[op.ID] {
-						fmt.Printf("[Peer %d]receive duplicate op:%+v", sc.me, op)
+						//fmt.Printf("[Peer %d]receive duplicate op:%+v", sc.me, op)
 						isDupOp = true
 					}
 					if !isDupOp {
+						sc.versionMap[op.ID] = op.Version
 						// create new config according to previous config
 						newConfig := new(Config)
 						err := deepCopy(newConfig, &sc.configs[len(sc.configs)-1])
@@ -289,6 +295,7 @@ func (sc *ShardCtrler) applyChHandler() {
 
 						switch op.Type {
 						case "Join":
+							//fmt.Printf("[Peer %d]join before: %+v\n", sc.me, newConfig)
 							for gid, servers := range op.ArgsJoin.Servers {
 								newConfig.Groups[gid] = servers
 							}
@@ -308,7 +315,7 @@ func (sc *ShardCtrler) applyChHandler() {
 									groupNumMap[gid]++
 								}
 							}
-
+							//fmt.Printf("[Peer %d]join after: %+v\n", sc.me, newConfig)
 						case "Leave":
 							leaveSet := make(map[int]bool)
 							for _, removeGid := range op.ArgsLeave.GIDs {
@@ -350,9 +357,10 @@ func (sc *ShardCtrler) applyChHandler() {
 						case "Move":
 							newConfig.Shards[op.ArgsMove.Shard] = op.ArgsMove.GID
 						}
+
+						sc.configs = append(sc.configs, *newConfig)
 					}
 				}
-
 
 				// 比对waitOpMap确定Leader身份
 				startOp := sc.waitOpMap[applyMsg.CommandIndex]
@@ -362,33 +370,35 @@ func (sc *ShardCtrler) applyChHandler() {
 					var sendReply interface{}
 					switch op.Type {
 					case "Query":
+
 						var replyConfig Config
 						if op.ArgsQuery.Num < 0 || op.ArgsQuery.Num >= len(sc.configs) {
 							replyConfig = sc.configs[len(sc.configs)-1]
 						} else {
 							replyConfig = sc.configs[op.ArgsQuery.Num]
 						}
+						//fmt.Printf("[Peer %d]receive query for %d, will reply %+v\n", sc.me, op.ArgsQuery.Num, replyConfig)
 						reply := QueryReply{
-							WrongLeader: true,
+							WrongLeader: false,
 							Err:         OK,
 							Config:      replyConfig,
 						}
 						sendReply = reply
 					case "Join":
 						reply := JoinReply{
-							WrongLeader: true,
+							WrongLeader: false,
 							Err:         OK,
 						}
 						sendReply = reply
 					case "Leave":
 						reply := LeaveReply{
-							WrongLeader: true,
+							WrongLeader: false,
 							Err:         OK,
 						}
 						sendReply = reply
 					case "Move":
 						reply := MoveReply{
-							WrongLeader: true,
+							WrongLeader: false,
 							Err:         OK,
 						}
 						sendReply = reply
@@ -403,7 +413,7 @@ func (sc *ShardCtrler) applyChHandler() {
 					// sent ErrLeader to all ch and close all ch
 					//kv.lock()
 					if len(sc.opWaitChs) > 0 {
-						fmt.Printf("[Peer %d] sent ErrLeader to all ch and close all ch\n", sc.me)
+						//fmt.Printf("[Peer %d] sent ErrLeader to all ch and close all ch\n", sc.me)
 						for index, ch := range sc.opWaitChs {
 							ch <- sc.genWrongLeaderReply(index)
 							close(ch)
@@ -422,7 +432,7 @@ func (sc *ShardCtrler) applyChHandler() {
 					continue
 				}
 				if len(sc.opWaitChs) > 0 {
-					fmt.Printf("[Peer %d] receive new Leader ApplyMsg, close all ch\n", sc.me)
+					//fmt.Printf("[Peer %d] receive new Leader ApplyMsg, close all ch\n", sc.me)
 				}
 				//kv.unlock()
 				for index, ch := range sc.opWaitChs {
@@ -454,18 +464,22 @@ func (sc *ShardCtrler) genWrongLeaderReply(index int) interface{} {
 	switch sc.waitOpMap[index].Type {
 	case "Join":
 		return JoinReply{
+			Err: FAIL,
 			WrongLeader: true,
 		}
 	case "Leave":
 		return LeaveReply{
+			Err: FAIL,
 			WrongLeader: true,
 		}
 	case "Move":
 		return MoveReply{
+			Err: FAIL,
 			WrongLeader: true,
 		}
 	case "Query":
 		return QueryReply{
+			Err: FAIL,
 			WrongLeader: true,
 		}
 	}
@@ -483,7 +497,7 @@ func (sc *ShardCtrler) unlock(name string) {
 	sc.lockName = ""
 	duration := sc.lockEnd.Sub(sc.lockStart)
 	if duration > 10*time.Millisecond {
-		fmt.Printf("long lock: %s, time: %s\n", name, duration)
+		//fmt.Printf("long lock: %s, time: %s\n", name, duration)
 	}
 	sc.mu.Unlock()
 }
@@ -504,13 +518,16 @@ func findMinGid(gidNumMap map[int]int) int {
 		if num < min {
 			resGid = gid
 			min = num
+		} else if num == min && gid < resGid {
+			resGid = gid
 		}
 	}
 	return resGid
 }
 
 func opEqual(op1, op2 Op) bool {
-	j1, _ := json.Marshal(op1)
-	j2, _ := json.Marshal(op2)
-	return string(j1) == string(j2)
+	return op1.Version == op2.Version
+	//j1, _ := json.Marshal(op1)
+	//j2, _ := json.Marshal(op2)
+	//return string(j1) == string(j2)
 }
