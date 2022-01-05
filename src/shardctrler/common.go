@@ -72,7 +72,7 @@ type MoveReply struct {
 type QueryArgs struct {
 	Num      int // desired config number
 	ClientID int
-	Version  int64
+	//Version  int64
 }
 
 type QueryReply struct {

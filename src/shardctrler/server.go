@@ -2,7 +2,11 @@ package shardctrler
 
 import (
 	"6.824/raft"
+	"bytes"
+	"encoding/gob"
+	"encoding/json"
 	"fmt"
+	"math"
 	"sync/atomic"
 	"time"
 )
@@ -21,9 +25,9 @@ type ShardCtrler struct {
 	configs []Config // indexed by config num
 
 	// for handling Op
-	opWaitChs map[int]chan interface{} // handling commitIndex -> chan for wait reply
-	waitOpMap map[int]Op               // handling commitIndex -> Op(insert by Start())
-	versionMap	map[int]int64
+	opWaitChs  map[int]chan interface{} // handling commitIndex -> chan for wait reply
+	waitOpMap  map[int]Op               // handling commitIndex -> Op(insert by Start())
+	versionMap map[int]int64
 
 	// lock debug
 	lockName  string
@@ -55,7 +59,7 @@ func (sc *ShardCtrler) Join(args *JoinArgs, reply *JoinReply) {
 
 	ver, ok := sc.versionMap[args.ClientID]
 	if !ok {
-		sc.versionMap[args.ClientID] = -1	// 目前还不能直接改为arg.Version，需要等待applyCh返回
+		sc.versionMap[args.ClientID] = -1 // 目前还不能直接改为arg.Version，需要等待applyCh返回
 	} else if args.Version <= ver {
 		// 重复请求
 		reply.Err = OK
@@ -75,7 +79,7 @@ func (sc *ShardCtrler) Join(args *JoinArgs, reply *JoinReply) {
 	sc.opWaitChs[index] = ch
 	sc.unlock("Join")
 
-	opHandlerReply := <- ch
+	opHandlerReply := <-ch
 
 	if joinReply, ok := opHandlerReply.(JoinReply); ok {
 		reply = &joinReply
@@ -98,7 +102,7 @@ func (sc *ShardCtrler) Leave(args *LeaveArgs, reply *LeaveReply) {
 
 	ver, ok := sc.versionMap[args.ClientID]
 	if !ok {
-		sc.versionMap[args.ClientID] = -1	// 目前还不能直接改为arg.Version，需要等待applyCh返回
+		sc.versionMap[args.ClientID] = -1 // 目前还不能直接改为arg.Version，需要等待applyCh返回
 	} else if args.Version <= ver {
 		// 重复请求
 		reply.Err = OK
@@ -106,9 +110,9 @@ func (sc *ShardCtrler) Leave(args *LeaveArgs, reply *LeaveReply) {
 	}
 
 	leaveOp := Op{
-		Type:     "Leave",
-		ID:       args.ClientID,
-		Version:  args.Version,
+		Type:      "Leave",
+		ID:        args.ClientID,
+		Version:   args.Version,
 		ArgsLeave: *args,
 	}
 
@@ -118,7 +122,7 @@ func (sc *ShardCtrler) Leave(args *LeaveArgs, reply *LeaveReply) {
 	sc.opWaitChs[index] = ch
 	sc.unlock("Leave")
 
-	opHandlerReply := <- ch
+	opHandlerReply := <-ch
 
 	if leaveReply, ok := opHandlerReply.(LeaveReply); ok {
 		reply = &leaveReply
@@ -141,7 +145,7 @@ func (sc *ShardCtrler) Move(args *MoveArgs, reply *MoveReply) {
 
 	ver, ok := sc.versionMap[args.ClientID]
 	if !ok {
-		sc.versionMap[args.ClientID] = -1	// 目前还不能直接改为arg.Version，需要等待applyCh返回
+		sc.versionMap[args.ClientID] = -1 // 目前还不能直接改为arg.Version，需要等待applyCh返回
 	} else if args.Version <= ver {
 		// 重复请求
 		reply.Err = OK
@@ -161,7 +165,7 @@ func (sc *ShardCtrler) Move(args *MoveArgs, reply *MoveReply) {
 	sc.opWaitChs[index] = ch
 	sc.unlock("Move")
 
-	opHandlerReply := <- ch
+	opHandlerReply := <-ch
 
 	if moveReply, ok := opHandlerReply.(MoveReply); ok {
 		reply = &moveReply
@@ -182,19 +186,10 @@ func (sc *ShardCtrler) Query(args *QueryArgs, reply *QueryReply) {
 		return
 	}
 
-	ver, ok := sc.versionMap[args.ClientID]
-	if !ok {
-		sc.versionMap[args.ClientID] = -1	// 目前还不能直接改为arg.Version，需要等待applyCh返回
-	} else if args.Version <= ver {
-		// 重复请求
-		reply.Err = OK
-		return
-	}
-
 	queryOp := Op{
-		Type:     "Query",
-		ID:       args.ClientID,
-		Version:  args.Version,
+		Type:      "Query",
+		ID:        args.ClientID,
+		//Version:   args.Version,
 		ArgsQuery: *args,
 	}
 
@@ -204,7 +199,7 @@ func (sc *ShardCtrler) Query(args *QueryArgs, reply *QueryReply) {
 	sc.opWaitChs[index] = ch
 	sc.unlock("Query")
 
-	opHandlerReply := <- ch
+	opHandlerReply := <-ch
 
 	if queryReply, ok := opHandlerReply.(QueryReply); ok {
 		reply = &queryReply
@@ -247,13 +242,16 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister)
 	sc.me = me
 
 	sc.configs = make([]Config, 1)
-	sc.configs[0].Groups = map[int][]string{}
+	sc.configs[0].Groups = map[int][]string{} //初始配置
 
 	labgob.Register(Op{})
 	sc.applyCh = make(chan raft.ApplyMsg)
 	sc.rf = raft.Make(servers, me, persister, sc.applyCh)
 
 	// Your code here.
+	sc.opWaitChs = make(map[int]chan interface{})
+	sc.waitOpMap = make(map[int]Op)
+	sc.versionMap = make(map[int]int64)
 
 	go sc.applyChHandler()
 	return sc
@@ -267,7 +265,175 @@ func (sc *ShardCtrler) applyChHandler() {
 				continue
 			}
 			op := applyMsg.Command.(Op)
+			if op.Type != "LeaderChange" {
+				sc.lock("RegularOp")
+				if op.Type != "Query" {
+					isDupOp := false
+					_, exist := sc.versionMap[op.ID]
+					if !exist {
+						// new Op
+						sc.versionMap[op.ID] = -1
+					}
+					if op.Version <= sc.versionMap[op.ID] {
+						fmt.Printf("[Peer %d]receive duplicate op:%+v", sc.me, op)
+						isDupOp = true
+					}
+					if !isDupOp {
+						// create new config according to previous config
+						newConfig := new(Config)
+						err := deepCopy(newConfig, &sc.configs[len(sc.configs)-1])
+						if err != nil {
+							panic("deepCopy failed")
+						}
+						newConfig.Num++
 
+						switch op.Type {
+						case "Join":
+							for gid, servers := range op.ArgsJoin.Servers {
+								newConfig.Groups[gid] = servers
+							}
+							avg := NShards / len(newConfig.Groups)
+							groupNumMap := make(map[int]int)
+							for gid := range newConfig.Groups {
+								groupNumMap[gid] = 0
+							}
+
+							for shard, gid := range newConfig.Shards {
+								// gid为非零的值，如果为0则忽略
+								if gid == 0 || groupNumMap[gid] >= avg {
+									targetGid := findMinGid(groupNumMap)
+									newConfig.Shards[shard] = targetGid
+									groupNumMap[targetGid]++
+								} else if gid != 0 {
+									groupNumMap[gid]++
+								}
+							}
+
+						case "Leave":
+							leaveSet := make(map[int]bool)
+							for _, removeGid := range op.ArgsLeave.GIDs {
+								delete(newConfig.Groups, removeGid)
+								leaveSet[removeGid] = true
+							}
+							var avg int
+							if len(newConfig.Groups) == 0 {
+								avg = NShards
+							} else {
+								avg = NShards / len(newConfig.Groups)
+							}
+							groupNumMap := make(map[int]int)
+							for gid := range newConfig.Groups {
+								groupNumMap[gid] = 0
+							}
+
+							for shard, gid := range newConfig.Shards {
+								if leaveSet[gid] {
+									// 需要重新分配该shard
+									if len(groupNumMap) > 0 {
+										targetGid := findMinGid(groupNumMap)
+										newConfig.Shards[shard] = targetGid
+										groupNumMap[targetGid]++
+									} else {
+										newConfig.Shards[shard] = 0 // 找不到分配的gid，直接置为0表示未分配，等待下次join分配
+									}
+								} else {
+									if groupNumMap[gid] >= avg {
+										targetGid := findMinGid(groupNumMap)
+										newConfig.Shards[shard] = targetGid
+										groupNumMap[targetGid]++
+									} else {
+										groupNumMap[gid]++
+									}
+								}
+							}
+
+						case "Move":
+							newConfig.Shards[op.ArgsMove.Shard] = op.ArgsMove.GID
+						}
+					}
+				}
+
+
+				// 比对waitOpMap确定Leader身份
+				startOp := sc.waitOpMap[applyMsg.CommandIndex]
+				waitCh, existCh := sc.opWaitChs[applyMsg.CommandIndex]
+
+				if opEqual(startOp, op) && existCh {
+					var sendReply interface{}
+					switch op.Type {
+					case "Query":
+						var replyConfig Config
+						if op.ArgsQuery.Num < 0 || op.ArgsQuery.Num >= len(sc.configs) {
+							replyConfig = sc.configs[len(sc.configs)-1]
+						} else {
+							replyConfig = sc.configs[op.ArgsQuery.Num]
+						}
+						reply := QueryReply{
+							WrongLeader: true,
+							Err:         OK,
+							Config:      replyConfig,
+						}
+						sendReply = reply
+					case "Join":
+						reply := JoinReply{
+							WrongLeader: true,
+							Err:         OK,
+						}
+						sendReply = reply
+					case "Leave":
+						reply := LeaveReply{
+							WrongLeader: true,
+							Err:         OK,
+						}
+						sendReply = reply
+					case "Move":
+						reply := MoveReply{
+							WrongLeader: true,
+							Err:         OK,
+						}
+						sendReply = reply
+					}
+					// sent to wait chan
+					waitCh <- sendReply
+					// close channel and delete the index from waitMap
+					close(waitCh)
+					delete(sc.opWaitChs, applyMsg.CommandIndex)
+					delete(sc.waitOpMap, applyMsg.CommandIndex)
+				} else {
+					// sent ErrLeader to all ch and close all ch
+					//kv.lock()
+					if len(sc.opWaitChs) > 0 {
+						fmt.Printf("[Peer %d] sent ErrLeader to all ch and close all ch\n", sc.me)
+						for index, ch := range sc.opWaitChs {
+							ch <- sc.genWrongLeaderReply(index)
+							close(ch)
+							delete(sc.opWaitChs, index)
+							delete(sc.waitOpMap, index)
+						}
+					}
+				}
+
+				sc.unlock("RegularOp")
+			} else {
+				// op.Type == "LeaderChange"
+				sc.lock("LeaderChangeHandle")
+				if op.ID == sc.me { // ignore this Op
+					sc.unlock("LeaderChangeHandle")
+					continue
+				}
+				if len(sc.opWaitChs) > 0 {
+					fmt.Printf("[Peer %d] receive new Leader ApplyMsg, close all ch\n", sc.me)
+				}
+				//kv.unlock()
+				for index, ch := range sc.opWaitChs {
+					ch <- sc.genWrongLeaderReply(index)
+					close(ch)
+					delete(sc.opWaitChs, index)
+					delete(sc.waitOpMap, index)
+				}
+				sc.unlock("LeaderChangeHandle")
+
+			}
 		} else if applyMsg.SnapshotValid {
 			// 无需快照
 		} else {
@@ -284,6 +450,28 @@ func (sc *ShardCtrler) applyChHandler() {
 	}
 }
 
+func (sc *ShardCtrler) genWrongLeaderReply(index int) interface{} {
+	switch sc.waitOpMap[index].Type {
+	case "Join":
+		return JoinReply{
+			WrongLeader: true,
+		}
+	case "Leave":
+		return LeaveReply{
+			WrongLeader: true,
+		}
+	case "Move":
+		return MoveReply{
+			WrongLeader: true,
+		}
+	case "Query":
+		return QueryReply{
+			WrongLeader: true,
+		}
+	}
+	panic("impossible type reply")
+}
+
 func (sc *ShardCtrler) lock(name string) {
 	sc.mu.Lock()
 	sc.lockStart = time.Now()
@@ -298,4 +486,31 @@ func (sc *ShardCtrler) unlock(name string) {
 		fmt.Printf("long lock: %s, time: %s\n", name, duration)
 	}
 	sc.mu.Unlock()
+}
+
+// 使用反射实现，目标类型变量需要导出
+func deepCopy(dst, src interface{}) error {
+	var buf bytes.Buffer
+	if err := gob.NewEncoder(&buf).Encode(src); err != nil {
+		return err
+	}
+	return gob.NewDecoder(bytes.NewBuffer(buf.Bytes())).Decode(dst)
+}
+
+func findMinGid(gidNumMap map[int]int) int {
+	min := math.MaxInt32
+	resGid := 0
+	for gid, num := range gidNumMap {
+		if num < min {
+			resGid = gid
+			min = num
+		}
+	}
+	return resGid
+}
+
+func opEqual(op1, op2 Op) bool {
+	j1, _ := json.Marshal(op1)
+	j2, _ := json.Marshal(op2)
+	return string(j1) == string(j2)
 }
