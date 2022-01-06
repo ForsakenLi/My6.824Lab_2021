@@ -46,6 +46,7 @@ func TestStaticShards(t *testing.T) {
 		check(t, ck, ka[i], va[i])
 	}
 
+	t.Log("shotdown")
 	// make sure that the data really is sharded by
 	// shutting down one shard and checking that some
 	// Get()s don't succeed.

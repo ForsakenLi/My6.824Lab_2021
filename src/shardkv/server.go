@@ -1,8 +1,8 @@
 package shardkv
 
-
 import (
 	"6.824/labrpc"
+	"6.824/shardctrler"
 	"bytes"
 	"fmt"
 	"sync/atomic"
@@ -12,15 +12,20 @@ import "6.824/raft"
 import "sync"
 import "6.824/labgob"
 
+const PullConfigTimeout = time.Millisecond * 100
+
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
-	Type    string
-	Key     string
-	Value   string
-	Version int64
-	ID      int
+	Type             string
+	Key              string
+	Value            string
+	Version          int64
+	ID               int
+	NewShardBelongMe [shardctrler.NShards]bool
+	NewShardVersion	 int
+	// todo Shard transfer
 }
 
 type OpHandlerReply struct {
@@ -35,13 +40,15 @@ type ShardKV struct {
 	applyCh      chan raft.ApplyMsg
 	make_end     func(string) *labrpc.ClientEnd
 	gid          int
-	ctrlers      []*labrpc.ClientEnd
-	maxraftstate int // snapshot if log grows this big
-	dead    int32 // set by Kill()
+	maxraftstate int   // snapshot if log grows this big
+	dead         int32 // set by Kill()
 
-	// Your definitions here.
-	versionMap	map[int]int64	// clientId->its version
-	kvMap	map[string]string
+	// shardctrler server and client
+	ctrlers      []*labrpc.ClientEnd
+	ctrlerClient *shardctrler.Clerk
+
+	versionMap map[int]int64 // clientId->its version
+	kvMap      map[string]string
 
 	// for handling Op
 	opWaitChs map[int]chan OpHandlerReply // handling commitIndex -> chan for wait reply
@@ -53,8 +60,13 @@ type ShardKV struct {
 	lockEnd   time.Time
 
 	persister *raft.Persister
-}
 
+	// config
+	PullConfigTimer *time.Timer
+	//Config	*shardctrler.Config
+	ShardBelongMe [shardctrler.NShards]bool
+	ConfigVersion int
+}
 
 func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
@@ -69,7 +81,7 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 
 	newOp := Op{
 		Type: "Get",
-		Key: args.Key,
+		Key:  args.Key,
 	}
 	index, _, _ := kv.rf.Start(newOp)
 
@@ -77,7 +89,7 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	kv.waitOpMap[index] = newOp
 	kv.opWaitChs[index] = ch
 	kv.unlock("Get")
-	opHandlerReply := <- ch
+	opHandlerReply := <-ch
 	kv.lock("Get")
 
 	reply.Err = opHandlerReply.Err
@@ -100,7 +112,7 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 
 	ver, ok := kv.versionMap[args.ClientID]
 	if !ok {
-		kv.versionMap[args.ClientID] = -1	// 目前还不能直接改为arg.Version，需要等待applyCh返回
+		kv.versionMap[args.ClientID] = -1 // 目前还不能直接改为arg.Version，需要等待applyCh返回
 	} else if args.Version <= ver {
 		// 重复请求
 		reply.Err = OK
@@ -123,7 +135,7 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	kv.waitOpMap[index] = newOp
 	kv.opWaitChs[index] = ch
 	kv.unlock("PutAppend")
-	opHandlerReply := <- ch
+	opHandlerReply := <-ch
 	kv.lock("PutAppend")
 
 	// create reply
@@ -189,6 +201,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.persister = persister
 
 	// Your initialization code here.
+	kv.ctrlerClient = shardctrler.MakeClerk(ctrlers)
 	kv.kvMap = make(map[string]string)
 	kv.opWaitChs = make(map[int]chan OpHandlerReply)
 	kv.waitOpMap = make(map[int]Op)
@@ -200,6 +213,16 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
+	kv.PullConfigTimer = time.NewTimer(PullConfigTimeout)
+
+	go func() {
+		for !kv.killed() {
+			select {
+			case <-kv.PullConfigTimer.C:
+				kv.updateConfig()
+			}
+		}
+	}()
 	kv.readPersist(persister.ReadSnapshot())
 
 	go kv.applyChHandler()
@@ -216,7 +239,7 @@ func (kv *ShardKV) unlock(name string) {
 	kv.lockEnd = time.Now()
 	kv.lockName = ""
 	duration := kv.lockEnd.Sub(kv.lockStart)
-	if duration > 10 * time.Millisecond {
+	if duration > 10*time.Millisecond {
 		fmt.Printf("long lock: %s, time: %s\n", name, duration)
 	}
 	kv.mu.Unlock()
@@ -227,6 +250,7 @@ func (kv *ShardKV) getPersistStateBytes() []byte {
 	e := labgob.NewEncoder(w)
 	e.Encode(kv.versionMap)
 	e.Encode(kv.kvMap)
+	e.Encode(kv.ShardBelongMe)
 	data := w.Bytes()
 	return data
 }
@@ -239,34 +263,44 @@ func (kv *ShardKV) readPersist(data []byte) {
 	d := labgob.NewDecoder(r)
 	var versionMap map[int]int64
 	var kvMap map[string]string
+	var shardBelongMe [shardctrler.NShards]bool
 	if d.Decode(&versionMap) != nil ||
+		d.Decode(shardBelongMe) != nil ||
 		d.Decode(&kvMap) != nil {
 		fmt.Printf("server %d readPersist(kv): decode error!", kv.me)
 	} else {
 		kv.versionMap = versionMap
 		kv.kvMap = kvMap
+		kv.ShardBelongMe = shardBelongMe
 	}
 }
 
 func (kv *ShardKV) applyChHandler() {
-	for !kv.killed(){
-		applyMsg := <- kv.applyCh
-		if applyMsg.CommandValid {	//是Op类型的applyMsg
+	for !kv.killed() {
+		applyMsg := <-kv.applyCh
+		if applyMsg.CommandValid { //是Op类型的applyMsg
 			if applyMsg.Command == nil {
 				continue
 			}
 			op := applyMsg.Command.(Op)
-			// 对于Leader，Get/Put/Append都需要找到对应这个Op的channel，以返回给接收方确认这个
-			// 请求已经被处理完成
-			// 在这里还有Leader身份判断的问题，如果先前Start写入这个index的Op和ApplyMsg返回的Op
-			// 有所不同，那么说明之前这个cmd我调用Start时没有被写入成功, 其实就是当时我已经不是Raft
-			// 多数派的Leader了，我的LogEntry没有被多数派认可，因此这里ApplyMsg返回的Op和我之前
-			// Start进去的Op不同，此时需要做返回ErrWrongLeader并关闭channel的操作。因此需要
-			// 验证返回的Op和之前Start写入的Op是否相同
+
+			if op.Type == "UpdateConfig" {
+				kv.lock("ChangeConfig")
+				if op.NewShardVersion > kv.ConfigVersion {
+					kv.ShardBelongMe = op.NewShardBelongMe
+				}
+				kv.unlock("ChangeConfig")
+				continue
+			}
 			if op.Type != "LeaderChange" {
 				kv.lock("RegularOp")
 				// check version to avoid duplicate Op, and update version (everyone)
 				isDupOp := false
+				isNotMyShard := false
+				if !kv.ShardBelongMe[key2shard(op.Key)] {
+					isNotMyShard = true
+					goto sendReply
+				}
 				if op.Type != "Get" {
 					_, exist := kv.versionMap[op.ID]
 					if !exist {
@@ -292,12 +326,14 @@ func (kv *ShardKV) applyChHandler() {
 					}
 				}
 				// 比对waitOpMap确定Leader身份
+			sendReply:
 				startOp := kv.waitOpMap[applyMsg.CommandIndex]
 				waitCh, existCh := kv.opWaitChs[applyMsg.CommandIndex]
 				//kv.unlock()
 				if startOp == op && existCh {
 					fmt.Printf("[Peer %d] leader handling Op reply of op %+v\n", kv.me, op)
 					var handlerReply OpHandlerReply
+
 					if op.Type == "Get" {
 						//kv.lock()
 						value, existKey := kv.kvMap[op.Key]
@@ -311,6 +347,9 @@ func (kv *ShardKV) applyChHandler() {
 					} else {
 						//op.Type == "Put"/"Append"
 						handlerReply.Err = OK
+					}
+					if isNotMyShard {
+						handlerReply.Err = ErrWrongGroup
 					}
 					// sent to wait chan
 					waitCh <- handlerReply
@@ -340,7 +379,7 @@ func (kv *ShardKV) applyChHandler() {
 			} else {
 				// op.Type == "LeaderChange"
 				kv.lock("LeaderChangeHandle")
-				if op.ID == kv.me {	// ignore this Op
+				if op.ID == kv.me { // ignore this Op
 					kv.unlock("LeaderChangeHandle")
 					continue
 				}
@@ -368,10 +407,40 @@ func (kv *ShardKV) applyChHandler() {
 			kv.lock("LeaderChange")
 			newOp := Op{
 				Type: "LeaderChange",
-				ID: kv.me,	// 如果我收到这条消息，则不需要做推出chan的处理
+				ID:   kv.me, // 如果我收到这条消息，则不需要做推出chan的处理
 			}
 			kv.rf.Start(newOp)
 			kv.unlock("LeaderChange")
 		}
 	}
+}
+
+func (kv *ShardKV) updateConfig() {
+	kv.PullConfigTimer.Reset(PullConfigTimeout)
+	if _, isLeader := kv.rf.GetState(); !isLeader {
+		return
+	}
+	// todo pending Shard更换pull逻辑
+	newConfig := kv.ctrlerClient.Query(-1)
+	kv.lock("updateConfig")
+	if newConfig.Num <= kv.ConfigVersion {
+		kv.unlock("updateConfig")
+		return
+	}
+	kv.ConfigVersion = newConfig.Num
+	for shard, gid := range newConfig.Shards {
+		if gid == kv.gid {
+			kv.ShardBelongMe[shard] = true
+		} else {
+			kv.ShardBelongMe[shard] = false
+		}
+	}
+	// 发布一个Op以同步Follower的Config
+	configUpdateOp := Op{
+		Type:             "UpdateConfig",
+		NewShardBelongMe: kv.ShardBelongMe,
+		NewShardVersion:  kv.ConfigVersion,	//如果自己收到了也无所谓，按照版本号判断
+	}
+	kv.unlock("updateConfig")
+	kv.rf.Start(configUpdateOp)
 }

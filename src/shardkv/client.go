@@ -108,6 +108,7 @@ func (ck *Clerk) Get(key string) string {
 // You will have to modify this function.
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
+	ck.version++
 	args := PutAppendArgs{}
 	args.Key = key
 	args.Value = value
