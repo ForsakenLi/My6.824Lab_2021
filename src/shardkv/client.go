@@ -35,11 +35,16 @@ func nrand() int64 {
 	return x
 }
 
+var myID = 0
+
 type Clerk struct {
 	sm       *shardctrler.Clerk
 	config   shardctrler.Config
 	make_end func(string) *labrpc.ClientEnd
 	// You will have to modify this struct.
+	ID int
+	version int64
+	lastServer int	// 上次联系为leader，下次直接从它开始就不用找了
 }
 
 //
@@ -56,6 +61,9 @@ func MakeClerk(ctrlers []*labrpc.ClientEnd, make_end func(string) *labrpc.Client
 	ck.sm = shardctrler.MakeClerk(ctrlers)
 	ck.make_end = make_end
 	// You'll have to add code here.
+	ck.ID = myID
+	myID++
+	ck.version = nrand()
 	return ck
 }
 
@@ -104,7 +112,8 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	args.Key = key
 	args.Value = value
 	args.Op = op
-
+	args.ClientID = ck.ID
+	args.Version = ck.version
 
 	for {
 		shard := key2shard(key)
