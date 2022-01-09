@@ -6,7 +6,6 @@ package shardctrler
 
 import (
 	"6.824/labrpc"
-	"fmt"
 )
 import "time"
 import "crypto/rand"
@@ -45,11 +44,11 @@ func (ck *Clerk) Query(num int) Config {
 	args.ClientID = ck.ID
 	for {
 		// try each known server.
-		for i, srv := range ck.servers {
+		for _, srv := range ck.servers {
 			var reply QueryReply
 			ok := srv.Call("ShardCtrler.Query", args, &reply)
 			if ok && reply.WrongLeader == false {
-				fmt.Printf("[Peer %d] return %+v\n", i, reply)
+				//fmt.Printf("[Peer %d] return %+v\n", i, reply)
 				return reply.Config
 			}
 		}

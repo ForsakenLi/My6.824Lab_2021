@@ -38,7 +38,7 @@ Checkpoint saved in `branch: Lab_2C_Persistence`.
 4. 代码逻辑问题
 
 #### Dec 21:
-最终确定并fix的我的代码中存在的问题, 经过确认, 这些问题都会导致`TestFigure8Unreliable2C`测试无法通过:
+以下是最终确定并fix的我的代码中存在的问题, 经过确认, 这些问题都会导致`TestFigure8Unreliable2C`测试无法通过:
 
 1. AppendEntries中忘记了重置State为Follower, 修改Term值为args的值(如果大于自己),以及重置选举计时器。
 
@@ -120,6 +120,40 @@ Checkpoint saved in `branch: Lab_3A_KV_WIO_Snapshots`.
 
 ### Lab 4A: The Shard controller
 
-本轮实验的coding难度不高，有了Lab3的基础基本上可以很顺利的完成。主要思路是在每台机器上维护相同的config状态机，需要注意的一点是在shard需要重新balance的时候，我们需要找一台目前已经被分配的shard最少的gid, 这时我们需要使用一个map来记录每个gid当前已经被分配了多少个shard，在寻找最少的那个gid时，我们不能简单的随意取一个值最小的，因为golang的map在迭代时顺序是被刻意打乱的，在每台机器上访问的顺序都不一致，如果我们只是选择值最小的gid，那么在每台机器上选择的gid可能会不一致，导致最终各台机器上的状态不一致。所以我们在选择gid时需要加上一个条件，即值一致时选择gid更小的那一个，这样就可以保证在不同机器上选择的gid也是一样的了。
+本轮实验的coding难度不高, 有了Lab3的基础基本上可以很顺利的完成。主要思路是在每台机器上维护相同的config状态机, 需要注意的一个坑是在shard需要重新balance的时候, 我们需要找一台目前已经被分配的shard最少的gid, 这时我们需要使用一个map来记录每个gid当前已经被分配了多少个shard, 在寻找最少的那个gid时, 我们不能简单的随意取一个值最小的, 因为golang的map在迭代时顺序是被刻意打乱的, 在每台机器上访问的顺序都不一致, 如果我们只是选择值最小的gid, 那么在每台机器上选择的gid可能会不一致, 导致最终各台机器上的状态不一致。所以我们在选择gid时需要加上一个条件, 即值一致时选择gid更小的那一个, 这样就可以保证在不同机器上选择的gid也是一样的了。
 
-### Lab 4B: Sharded Key/Value Server
+### Lab 4B: Sharded Key/Value Server With Challenge 1 & 2
+
+#### 架构设计
+
+由于我一开始准备一步到位完成Challenge 1和2, 所以花了大概3天时间思考代码的设计架构, 实话说本部分实验作为课程的期末作业还是很有难度的。为了满足Challenge 1和2给定的分片清理和分片独立迁移的功能, 看了网上博主关于这个问题的理解后, 我觉得可以通过以下几点来保证能够通过所有test和challenge, 保证实现时的数据安全性：
+
+##### Shard状态设计
+
+无论是采用pull还是push模式, 由于Challenge 2要求在分片数据迁移时各个分片相互独立, 未处于迁移过程中的分片读写不能受到影响, 因此将不同的Shard独立成单独的结构是非常必要的。这里我们需要为Shard设计一个状态位来标志其状态, 以push为例, 我们会需要Regular, Pushing, WaitPush三个状态：
+
+1. Regular: 默认的状态, 无论本raft组管理该分片与否, 在默认情况状态下都处于该状态, 如果根据config本Shard归属于本raft组管理则正常提供服务。此外, 如果所有分片都处于该状态下则不会阻塞Config的更新。
+
+2. Pushing: 如果config在update时发现前一个版本中的某个分片在新的版本不存在了, 即迁移到其他raft组去了, 我们就可以将这个group的状态标记为Pushing。此后这个分片就不会提供读写服务了, 读写会直接返回ErrWrongGroup。在迁移协程扫描到这里时, 会发起向目标group发起PushShard RPC, 当我们收到OK的Reply之后, 即可以立即删除该Shard在本地的数据。
+
+3. WaitPush: 如果config在update时发现新版本出现了旧版本中未曾出现的分片, 则将对应分片置为WaitPush状态, 等待接收push RPC。
+
+##### Config更新时的安全性
+
+有一个很极端的情况, 如果一个raft组有半数以上的机器挂了(即这个raft组对外表现为不可工作状态), 那么可不可能集群里的其他机器更新到一个新的config后, 这个还位于旧版本的raft组recover了, 拉取新的config之后某些分片处于WaitPush的状态, 但由于其他raft组已经位于新的config下, 所以这个落后的raft组会一直无法完成更新config。
+
+这个问题我思考了很久, 这个问题的解决方案是：我为Shard加上了一个WaitPush状态, 同时确定了Config更新的条件：当所有分片都为Regular状态时, 才能更新到下一个版本的Config。通过这两点我们就可以保证Config更新的原子性, 一旦一个raft组从controller处拉取了下个版本的config, 无论它本轮是Shard的接收方还是发送方或二者皆有, 在完成分片的交换前它都无法更新到下个配置(WaitPush是制约接收方的, 如果它发现本轮要接收分片就必须等待分片到达才能继续更新Config)。由于这个限制对于接收双方都存在, 如果一个raft组对外表现为不工作状态, 那么所有依赖其数据的raft组无论是要发给它还是需要它的分片, 全部都会停留在当前config上, 形成一个故障raft组集合(其实分片读写还是ok的, 只是配置不会更新了)；如果后续还有config更新, 则所有和这个故障raft组集合中任意raft组有分片交换需求的raft组都会无法更新config, 最终甚至可能所有raft组都无法更新配置。
+
+其实对外看来, 整个multi-raft集群真正出现读写故障的只有最初那个raft组上的分片, 以及更新config版本的故障, 在生产环境中这种仅一个raft组出现故障的概率其实很低。这个Lab4实验据Morris教授所说, 原型是Google的Spanner, 在6.824这一课程中我们曾读过Spanner的论文, 在Spanner中每个raft组的物理机都位于多个DataCenter, 而不同的raft组下层DataCenter组是一致的, 很可能一个DataCenter拥有属于不同raft组的多个实例, 而一旦出现了一个raft组大部分机器都crash也很可能意味着多个不止一个raft组crash了, 这种情况自然也超过了multi-raft集群安全性的讨论范围。
+
+![Spanner](src/image/spanner.png)
+
+##### 分片清理和迁移的安全性
+
+首先需要讨论的是分片迁移时, 是选择pull还是选择push的问题, 我认为push是优于pull的, 这是因为在我们使用pull RPC时, 数据是在Reply中返回给Shard接收方的, 但作为发送方我们无法确认这个Reply对方到底接收成功没有。因此在采用pull方式时我们还需要设计一个ack RPC, 在Shard接收方收到pull RPC的Reply后, 再给对方发送一个ack RPC, 表示之前发送的分片可以删除了, 这时Shard发送方才能删除之前的分片数据。
+
+![Pull VS Push](src/image/pullpush.png)
+
+而push模式则没有这个问题, Shard发送方主动的在push RPC的Args中发送分片数据给接收方, 接收方在确认数据收到后才会返回这个reply, 接收方收到RPC的reply后马上就可以删除这个之前的分片, 少了一个RPC。就算这个接收方返回的reply没收到, 发送方重新push了, 我们也可以根据分片的状态和config版本号来确认：只有当push Args中发送方的Config版本号和当前自己的版本号一致, 且该分片处于waitPush状态才会接收这个push传来的数据。这样就保证了数据迁移的安全性。
+
+至于分区清理的安全性, 由于采用了push模式, 只要分片发送方收到push RPC的reply, 即可认为数据安全到达, 此时立即删除分片数据即可, 不必和pull模式一样再设置一个ack RPC, 收到确认后再进行删除。

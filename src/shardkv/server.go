@@ -14,25 +14,6 @@ import "6.824/labgob"
 
 const PullConfigTimeout = time.Millisecond * 100
 
-type Op struct {
-	// Your definitions here.
-	// Field names must start with capital letters,
-	// otherwise RPC will break.
-	Type             string
-	Key              string
-	Value            string
-	Version          int64
-	ID               int
-	NewShardBelongMe [shardctrler.NShards]bool
-	NewShardVersion	 int
-	// todo Shard transfer
-}
-
-type OpHandlerReply struct {
-	Err   Err
-	Value string
-}
-
 type ShardKV struct {
 	mu           sync.Mutex
 	me           int
@@ -47,8 +28,9 @@ type ShardKV struct {
 	ctrlers      []*labrpc.ClientEnd
 	ctrlerClient *shardctrler.Clerk
 
-	versionMap map[int]int64 // clientId->its version
-	kvMap      map[string]string
+	//versionMap map[int]int64 // clientId->its version
+	//kvMap      map[string]string
+	ShardCollection	[shardctrler.NShards]*ShardData
 
 	// for handling Op
 	opWaitChs map[int]chan OpHandlerReply // handling commitIndex -> chan for wait reply
@@ -64,8 +46,8 @@ type ShardKV struct {
 	// config
 	PullConfigTimer *time.Timer
 	//Config	*shardctrler.Config
-	ShardBelongMe [shardctrler.NShards]bool
-	ConfigVersion int
+	//ShardBelongMe [shardctrler.NShards]bool
+	prevConfig, nowConfig	shardctrler.Config
 }
 
 func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
@@ -109,11 +91,12 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	}
 
 	// 需要通过版本号来确认这个请求是否是重复发送的，如果一个请求被确认append成功，则版本号才会被修改为args中的
-
-	ver, ok := kv.versionMap[args.ClientID]
-	if !ok {
-		kv.versionMap[args.ClientID] = -1 // 目前还不能直接改为arg.Version，需要等待applyCh返回
-	} else if args.Version <= ver {
+	shardNum := key2shard(args.Key)
+	ver, _ := kv.ShardCollection[shardNum].VersionMap[args.ClientID]
+	//if !ok {
+	//	kv.ShardCollection[shardNum].VersionMap[args.ClientID] = -1 // 目前还不能直接改为arg.Version，需要等待applyCh返回
+	//} else
+	if args.Version <= ver {
 		// 重复请求
 		reply.Err = OK
 		return
@@ -202,10 +185,17 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 
 	// Your initialization code here.
 	kv.ctrlerClient = shardctrler.MakeClerk(ctrlers)
-	kv.kvMap = make(map[string]string)
+	//kv.kvMap = make(map[string]string)
 	kv.opWaitChs = make(map[int]chan OpHandlerReply)
 	kv.waitOpMap = make(map[int]Op)
-	kv.versionMap = make(map[int]int64)
+	//kv.versionMap = make(map[int]int64)
+	for i := 0; i < shardctrler.NShards; i++ {
+		kv.ShardCollection[i] = &ShardData{
+			VersionMap: make(map[int]int64),
+			KvMap:      make(map[string]string),
+			State:      Regular,
+		}
+	}
 
 	// Use something like this to talk to the shardctrler:
 	// kv.mck = shardctrler.MakeClerk(kv.ctrlers)
@@ -248,9 +238,9 @@ func (kv *ShardKV) unlock(name string) {
 func (kv *ShardKV) getPersistStateBytes() []byte {
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
-	e.Encode(kv.versionMap)
-	e.Encode(kv.kvMap)
-	e.Encode(kv.ShardBelongMe)
+	e.Encode(kv.ShardCollection)
+	e.Encode(kv.prevConfig)
+	e.Encode(kv.nowConfig)
 	data := w.Bytes()
 	return data
 }
@@ -261,97 +251,53 @@ func (kv *ShardKV) readPersist(data []byte) {
 	}
 	r := bytes.NewBuffer(data)
 	d := labgob.NewDecoder(r)
-	var versionMap map[int]int64
-	var kvMap map[string]string
-	var shardBelongMe [shardctrler.NShards]bool
-	if d.Decode(&versionMap) != nil ||
-		d.Decode(shardBelongMe) != nil ||
-		d.Decode(&kvMap) != nil {
+	var ShardCollection [shardctrler.NShards]*ShardData
+	var prevConfig, nowConfig shardctrler.Config
+	if d.Decode(&ShardCollection) != nil ||
+		d.Decode(&prevConfig) != nil ||
+		d.Decode(&nowConfig) != nil {
 		fmt.Printf("server %d readPersist(kv): decode error!", kv.me)
 	} else {
-		kv.versionMap = versionMap
-		kv.kvMap = kvMap
-		kv.ShardBelongMe = shardBelongMe
+		kv.ShardCollection = ShardCollection
+		kv.nowConfig = nowConfig
+		kv.prevConfig = prevConfig
 	}
 }
 
 func (kv *ShardKV) applyChHandler() {
 	for !kv.killed() {
 		applyMsg := <-kv.applyCh
-		if applyMsg.CommandValid { //是Op类型的applyMsg
+		if applyMsg.CommandValid {
 			if applyMsg.Command == nil {
 				continue
 			}
 			op := applyMsg.Command.(Op)
 
 			if op.Type == "UpdateConfig" {
-				kv.lock("ChangeConfig")
-				if op.NewShardVersion > kv.ConfigVersion {
-					kv.ShardBelongMe = op.NewShardBelongMe
-				}
-				kv.unlock("ChangeConfig")
+				kv.updateConfigHandle(&op.NewConfig)
 				continue
 			}
-			if op.Type != "LeaderChange" {
+			if op.Type == "LeaderChange" {
+				kv.LeaderChangeHandle(op)
+				continue
+			}
+			// todo kv transfer
+			if isRegularOp(&op) {
 				kv.lock("RegularOp")
-				// check version to avoid duplicate Op, and update version (everyone)
-				isDupOp := false
-				isNotMyShard := false
-				if !kv.ShardBelongMe[key2shard(op.Key)] {
-					isNotMyShard = true
-					goto sendReply
+				var handlerReply OpHandlerReply
+				shardNum := key2shard(op.Key)
+				if kv.nowConfig.Shards[shardNum] != kv.gid {
+					handlerReply.Err = ErrWrongGroup
+				} else {
+					DPrintf("[Peer %d] execute op: %+v\n", kv.me, op)
+					handlerReply = kv.ShardCollection[shardNum].ModifyKV(&op)
 				}
-				if op.Type != "Get" {
-					_, exist := kv.versionMap[op.ID]
-					if !exist {
-						// new Op
-						kv.versionMap[op.ID] = -1
-					}
-					if op.Version <= kv.versionMap[op.ID] {
-						fmt.Printf("[Peer %d]receive duplicate op:%+v", kv.me, op)
-						isDupOp = true
-					}
-				}
-				// update kvMap (everyone)
-				if !isDupOp {
-					kv.versionMap[op.ID] = op.Version
-					if op.Type == "Put" {
-						kv.kvMap[op.Key] = op.Value
-					} else if op.Type == "Append" {
-						if origin, ok := kv.kvMap[op.Key]; ok {
-							kv.kvMap[op.Key] = origin + op.Value
-						} else {
-							kv.kvMap[op.Key] = op.Value
-						}
-					}
-				}
-				// 比对waitOpMap确定Leader身份
-			sendReply:
 				startOp := kv.waitOpMap[applyMsg.CommandIndex]
 				waitCh, existCh := kv.opWaitChs[applyMsg.CommandIndex]
 				//kv.unlock()
-				if startOp == op && existCh {
-					fmt.Printf("[Peer %d] leader handling Op reply of op %+v\n", kv.me, op)
-					var handlerReply OpHandlerReply
-
-					if op.Type == "Get" {
-						//kv.lock()
-						value, existKey := kv.kvMap[op.Key]
-						//kv.unlock()
-						if existKey {
-							handlerReply.Value = value
-							handlerReply.Err = OK
-						} else {
-							handlerReply.Err = ErrNoKey
-						}
-					} else {
-						//op.Type == "Put"/"Append"
-						handlerReply.Err = OK
-					}
-					if isNotMyShard {
-						handlerReply.Err = ErrWrongGroup
-					}
+				if startOp.Version == op.Version && existCh {
 					// sent to wait chan
+					DPrintf("[Peer %d] sent handler reply: %+v\n", kv.me, handlerReply)
 					waitCh <- handlerReply
 					// close channel and delete the index from waitMap
 					close(waitCh)
@@ -372,75 +318,55 @@ func (kv *ShardKV) applyChHandler() {
 						}
 					}
 				}
-				if kv.maxraftstate != -1 && float32(kv.persister.RaftStateSize()) > float32(kv.maxraftstate)*0.9 {
-					kv.rf.Snapshot(applyMsg.CommandIndex, kv.getPersistStateBytes())
-				}
+
 				kv.unlock("RegularOp")
-			} else {
-				// op.Type == "LeaderChange"
-				kv.lock("LeaderChangeHandle")
-				if op.ID == kv.me { // ignore this Op
-					kv.unlock("LeaderChangeHandle")
-					continue
-				}
-				if len(kv.opWaitChs) > 0 {
-					fmt.Printf("[Peer %d] receive new Leader ApplyMsg, close all ch\n", kv.me)
-				}
-				//kv.unlock()
-				for index, ch := range kv.opWaitChs {
-					ch <- OpHandlerReply{ErrWrongLeader, ""}
-					close(ch)
-					//kv.lock()
-					delete(kv.opWaitChs, index)
-					delete(kv.waitOpMap, index)
-					//kv.unlock()
-				}
-				kv.unlock("LeaderChangeHandle")
 			}
 		} else if applyMsg.SnapshotValid {
 			if kv.rf.CondInstallSnapshot(applyMsg.SnapshotTerm, applyMsg.SnapshotIndex, applyMsg.Snapshot) {
 				kv.readPersist(applyMsg.Snapshot)
 			}
 		} else {
-			// I win the election, send a Op to let the old leader know, because we have
-			// to notify it to close its opWaitChs(it have lost the qualification)
-			kv.lock("LeaderChange")
-			newOp := Op{
-				Type: "LeaderChange",
-				ID:   kv.me, // 如果我收到这条消息，则不需要做推出chan的处理
-			}
-			kv.rf.Start(newOp)
-			kv.unlock("LeaderChange")
+			// applyMsg.SnapshotValid == false && applyMsg.CommandValid == false
+			kv.LeaderChange()
 		}
+		kv.CheckPersist(applyMsg)
 	}
 }
 
-func (kv *ShardKV) updateConfig() {
-	kv.PullConfigTimer.Reset(PullConfigTimeout)
-	if _, isLeader := kv.rf.GetState(); !isLeader {
+func (kv *ShardKV) CheckPersist(applyMsg raft.ApplyMsg) {
+	kv.lock("CheckPersist")
+	if kv.maxraftstate != -1 && float32(kv.persister.RaftStateSize()) > float32(kv.maxraftstate)*0.9 {
+		kv.rf.Snapshot(applyMsg.CommandIndex, kv.getPersistStateBytes())
+	}
+	kv.unlock("CheckPersist")
+}
+
+func (kv *ShardKV) LeaderChangeHandle(op Op) {
+	// op.Type == "LeaderChange"
+	kv.lock("LeaderChangeHandle")
+	if op.ID == kv.me { // ignore this Op
+		kv.unlock("LeaderChangeHandle")
 		return
 	}
-	// todo pending Shard更换pull逻辑
-	newConfig := kv.ctrlerClient.Query(-1)
-	kv.lock("updateConfig")
-	if newConfig.Num <= kv.ConfigVersion {
-		kv.unlock("updateConfig")
-		return
+	if len(kv.opWaitChs) > 0 {
+		fmt.Printf("[Peer %d] receive new Leader ApplyMsg, close all ch\n", kv.me)
 	}
-	kv.ConfigVersion = newConfig.Num
-	for shard, gid := range newConfig.Shards {
-		if gid == kv.gid {
-			kv.ShardBelongMe[shard] = true
-		} else {
-			kv.ShardBelongMe[shard] = false
-		}
+	//kv.unlock()
+	for index, ch := range kv.opWaitChs {
+		ch <- OpHandlerReply{ErrWrongLeader, ""}
+		close(ch)
+		delete(kv.opWaitChs, index)
+		delete(kv.waitOpMap, index)
 	}
-	// 发布一个Op以同步Follower的Config
-	configUpdateOp := Op{
-		Type:             "UpdateConfig",
-		NewShardBelongMe: kv.ShardBelongMe,
-		NewShardVersion:  kv.ConfigVersion,	//如果自己收到了也无所谓，按照版本号判断
+	kv.unlock("LeaderChangeHandle")
+}
+
+func (kv *ShardKV) LeaderChange() {
+	kv.lock("LeaderChange")
+	newOp := Op{
+		Type: "LeaderChange",
+		ID:   kv.me, // 如果我收到这条消息，则不需要做推出chan的处理
 	}
-	kv.unlock("updateConfig")
-	kv.rf.Start(configUpdateOp)
+	kv.rf.Start(newOp)
+	kv.unlock("LeaderChange")
 }
