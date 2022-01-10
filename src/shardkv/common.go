@@ -63,6 +63,7 @@ type Op struct {
 	CleanShardNum	int
 	ReceiveShard	ShardData
 	ReceiveShardNum int
+	ConfigNum		int		// for both clean and push
 }
 
 type OpHandlerReply struct {

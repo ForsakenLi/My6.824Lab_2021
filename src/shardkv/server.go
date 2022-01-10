@@ -320,7 +320,7 @@ func (kv *ShardKV) applyChHandler() {
 				//kv.unlock()
 				if startOp.Version == op.Version && existCh {
 					// sent to wait chan
-					DPrintf("[Peer %d] sent handler reply: %+v\n", kv.me, handlerReply)
+					DPrintf("[Peer %d, Group %d] sent handler reply: %+v\n", kv.me, kv.gid, handlerReply)
 					waitCh <- handlerReply
 					// close channel and delete the index from waitMap
 					close(waitCh)
@@ -332,7 +332,7 @@ func (kv *ShardKV) applyChHandler() {
 					// sent ErrLeader to all ch and close all ch
 					//kv.lock()
 					if len(kv.opWaitChs) > 0 {
-						DPrintf("[Peer %d] sent ErrLeader to all ch and close all ch\n", kv.me)
+						DPrintf("[Peer %d Group %d] sent ErrLeader to all ch and close all ch\n", kv.me, kv.gid)
 						for index, ch := range kv.opWaitChs {
 							ch <- OpHandlerReply{ErrWrongLeader, ""} // 理论上这里不会被阻塞，Op发起方应该在等待其返回
 							close(ch)
@@ -372,7 +372,7 @@ func (kv *ShardKV) LeaderChangeHandle(op Op) {
 		return
 	}
 	if len(kv.opWaitChs) > 0 {
-		DPrintf("[Peer %d] receive new Leader ApplyMsg, close all ch\n", kv.me)
+		DPrintf("[Peer %d Group %d] receive new Leader ApplyMsg, close all ch\n", kv.me, kv.gid)
 	}
 	//kv.unlock()
 	for index, ch := range kv.opWaitChs {

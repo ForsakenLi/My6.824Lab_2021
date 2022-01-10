@@ -37,7 +37,7 @@ func (kv *ShardKV) updateConfigHandle(nextConfig *shardctrler.Config)  {
 		kv.updateShardState(nextConfig)	// 更新分片state
 		kv.nowConfig = *nextConfig
 	} else {
-		DPrintf("[Peer %d] receive outdated or advanced config %+v", kv.me, nextConfig)
+		DPrintf("[Peer %d Group %d] receive outdated or advanced config %+v", kv.me, kv.gid ,nextConfig)
 	}
 }
 

@@ -38,15 +38,16 @@ func (kv *ShardKV) dataTransfer() {
 					server := kv.make_end(serverName)
 					var reply PushShardReply
 					if server.Call("ShardKV.PushShard", args, &reply) && reply.Reply == "OK" {
-						DPrintf("[Peer %d] Push Shard to raft group %d success %+v", kv.me, kv.gid, args)
+						DPrintf("[Peer %d Group %d] Push Shard success %+v", kv.me, kv.gid, args)
 						cleanOp := Op{
 							Type:          "CleanShard",
 							CleanShardNum: shardNum,
+							ConfigNum:     args.ConfigNum,
 						}
 						kv.rf.Start(cleanOp)
 					}
 				}
-			}(&args, kv.nowConfig.Groups[gid], shardNum)	//最后这个shardNum一定要传进去，否则会导致协程内读取外部的for-each迭代变量
+			}(&args, kv.nowConfig.Groups[gid], shardNum) //最后这个shardNum一定要传进去，否则会导致协程内读取外部的for-each迭代变量
 		}
 	}
 	kv.unlock("DataTransfer")
@@ -60,21 +61,19 @@ func (kv *ShardKV) PushShard(args *PushShardArgs, reply *PushShardReply) {
 		return
 	}
 	kv.lock("PushShard")
-	if args.ConfigNum == kv.nowConfig.Num && kv.ShardCollection[args.ShardNum].State == WaitPush {
-		DPrintf("[Peer %d] push success in config num %d\n", kv.me, kv.nowConfig.Num)
+	if args.ConfigNum >= kv.nowConfig.Num {
+		DPrintf("[Peer %d, Group %d] push success in config num %d\n", kv.me, kv.gid, kv.nowConfig.Num)
 		var copyShard = args.Shard.deepCopy()
 		recShardOp := Op{
 			Type:            "ReceiveShard",
 			ReceiveShard:    copyShard,
 			ReceiveShardNum: args.ShardNum,
+			ConfigNum:       args.ConfigNum,
 		}
 		kv.rf.Start(recShardOp)
 		reply.Reply = OK
-	} else if args.ConfigNum == kv.nowConfig.Num && kv.ShardCollection[args.ShardNum].State == Regular {
-		reply.Reply = OK
-		DPrintf("[Peer %d] receive duplicate Push RPC, my config: %+v, shard %d state %d, args %+v\n", kv.me, kv.nowConfig, args.ShardNum, kv.ShardCollection[args.ShardNum].State, args)
 	} else {
-		DPrintf("[Peer %d] receive outdated Push RPC, my config: %+v, shard %d state %d, args %+v\n", kv.me, kv.nowConfig, args.ShardNum, kv.ShardCollection[args.ShardNum].State, args)
+		DPrintf("[Peer %d, Group %d] receive outdated Push RPC, my config: %+v, shard %d state %d, args %+v\n", kv.me, kv.gid, kv.nowConfig, args.ShardNum, kv.ShardCollection[args.ShardNum].State, args)
 	}
 	kv.unlock("PushShard")
 }
@@ -82,16 +81,20 @@ func (kv *ShardKV) PushShard(args *PushShardArgs, reply *PushShardReply) {
 func (kv *ShardKV) cleanShardHandle(op *Op) {
 	kv.lock("cleanShardHandle")
 	defer kv.unlock("cleanShardHandle")
-	kv.ShardCollection[op.CleanShardNum] = &ShardData{
-		VersionMap: make(map[int]int64),
-		KvMap:      make(map[string]string),
-		State:      Regular,
+	if op.ConfigNum == kv.nowConfig.Num && kv.ShardCollection[op.CleanShardNum].State == Pushing {
+		kv.ShardCollection[op.CleanShardNum] = &ShardData{
+			VersionMap: make(map[int]int64),
+			KvMap:      make(map[string]string),
+			State:      Regular,
+		}
 	}
 }
 
 func (kv *ShardKV) receiveShardHandle(op *Op) {
 	kv.lock("receiveShardHandle")
 	defer kv.unlock("receiveShardHandle")
-	var copyShard = op.ReceiveShard.deepCopy()
-	kv.ShardCollection[op.ReceiveShardNum] = &copyShard
+	if op.ConfigNum == kv.nowConfig.Num && kv.ShardCollection[op.ReceiveShardNum].State == WaitPush {
+		var copyShard = op.ReceiveShard.deepCopy()
+		kv.ShardCollection[op.ReceiveShardNum] = &copyShard
+	}
 }
