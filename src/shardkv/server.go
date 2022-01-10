@@ -4,7 +4,6 @@ import (
 	"6.824/labrpc"
 	"6.824/shardctrler"
 	"bytes"
-	"fmt"
 	"sync/atomic"
 	"time"
 )
@@ -12,7 +11,11 @@ import "6.824/raft"
 import "sync"
 import "6.824/labgob"
 
-const PullConfigTimeout = time.Millisecond * 100
+const (
+	PullConfigTimeout = time.Millisecond * 200
+	DataTransferTimeout = time.Millisecond * 100
+	Debug = true
+)
 
 type ShardKV struct {
 	mu           sync.Mutex
@@ -45,9 +48,11 @@ type ShardKV struct {
 
 	// config
 	PullConfigTimer *time.Timer
-	//Config	*shardctrler.Config
-	//ShardBelongMe [shardctrler.NShards]bool
-	prevConfig, nowConfig	shardctrler.Config
+	nowConfig	shardctrler.Config
+
+	// shard transfer
+	TransferTimer *time.Timer
+
 }
 
 func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
@@ -174,6 +179,10 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	// call labgob.Register on structures you want
 	// Go's RPC library to marshall/unmarshall.
 	labgob.Register(Op{})
+	labgob.Register(shardctrler.Config{})
+	labgob.Register(PushShardArgs{})
+	labgob.Register(PushShardReply{})
+	labgob.Register(ShardData{})
 
 	kv := new(ShardKV)
 	kv.me = me
@@ -185,10 +194,8 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 
 	// Your initialization code here.
 	kv.ctrlerClient = shardctrler.MakeClerk(ctrlers)
-	//kv.kvMap = make(map[string]string)
 	kv.opWaitChs = make(map[int]chan OpHandlerReply)
 	kv.waitOpMap = make(map[int]Op)
-	//kv.versionMap = make(map[int]int64)
 	for i := 0; i < shardctrler.NShards; i++ {
 		kv.ShardCollection[i] = &ShardData{
 			VersionMap: make(map[int]int64),
@@ -197,14 +204,11 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 		}
 	}
 
-	// Use something like this to talk to the shardctrler:
-	// kv.mck = shardctrler.MakeClerk(kv.ctrlers)
-
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	kv.PullConfigTimer = time.NewTimer(PullConfigTimeout)
-
+	// 配置更新协程
 	go func() {
 		for !kv.killed() {
 			select {
@@ -213,8 +217,21 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 			}
 		}
 	}()
+
+	kv.TransferTimer = time.NewTimer(DataTransferTimeout)
+	// 数据迁移&清理协程
+	go func() {
+		for !kv.killed() {
+			select {
+			case <-kv.TransferTimer.C:
+				kv.dataTransfer()
+			}
+		}
+	}()
+
 	kv.readPersist(persister.ReadSnapshot())
 
+	// 日志处理协程
 	go kv.applyChHandler()
 	return kv
 }
@@ -230,7 +247,7 @@ func (kv *ShardKV) unlock(name string) {
 	kv.lockName = ""
 	duration := kv.lockEnd.Sub(kv.lockStart)
 	if duration > 10*time.Millisecond {
-		fmt.Printf("long lock: %s, time: %s\n", name, duration)
+		DPrintf("long lock: %s, time: %s\n", name, duration)
 	}
 	kv.mu.Unlock()
 }
@@ -239,7 +256,7 @@ func (kv *ShardKV) getPersistStateBytes() []byte {
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
 	e.Encode(kv.ShardCollection)
-	e.Encode(kv.prevConfig)
+	//e.Encode(kv.prevConfig)
 	e.Encode(kv.nowConfig)
 	data := w.Bytes()
 	return data
@@ -252,15 +269,14 @@ func (kv *ShardKV) readPersist(data []byte) {
 	r := bytes.NewBuffer(data)
 	d := labgob.NewDecoder(r)
 	var ShardCollection [shardctrler.NShards]*ShardData
-	var prevConfig, nowConfig shardctrler.Config
+	var nowConfig shardctrler.Config
 	if d.Decode(&ShardCollection) != nil ||
-		d.Decode(&prevConfig) != nil ||
 		d.Decode(&nowConfig) != nil {
-		fmt.Printf("server %d readPersist(kv): decode error!", kv.me)
+		DPrintf("server %d readPersist(kv): decode error!", kv.me)
 	} else {
 		kv.ShardCollection = ShardCollection
 		kv.nowConfig = nowConfig
-		kv.prevConfig = prevConfig
+		//kv.prevConfig = prevConfig
 	}
 }
 
@@ -268,11 +284,11 @@ func (kv *ShardKV) applyChHandler() {
 	for !kv.killed() {
 		applyMsg := <-kv.applyCh
 		if applyMsg.CommandValid {
+			kv.CheckPersist(applyMsg)
 			if applyMsg.Command == nil {
 				continue
 			}
 			op := applyMsg.Command.(Op)
-
 			if op.Type == "UpdateConfig" {
 				kv.updateConfigHandle(&op.NewConfig)
 				continue
@@ -281,7 +297,14 @@ func (kv *ShardKV) applyChHandler() {
 				kv.LeaderChangeHandle(op)
 				continue
 			}
-			// todo kv transfer
+			if op.Type == "CleanShard" {
+				kv.cleanShardHandle(&op)
+				continue
+			}
+			if op.Type == "ReceiveShard" {
+				kv.receiveShardHandle(&op)
+				continue
+			}
 			if isRegularOp(&op) {
 				kv.lock("RegularOp")
 				var handlerReply OpHandlerReply
@@ -289,8 +312,8 @@ func (kv *ShardKV) applyChHandler() {
 				if kv.nowConfig.Shards[shardNum] != kv.gid {
 					handlerReply.Err = ErrWrongGroup
 				} else {
-					DPrintf("[Peer %d] execute op: %+v\n", kv.me, op)
-					handlerReply = kv.ShardCollection[shardNum].ModifyKV(&op)
+					//DPrintf("[Peer %d] execute op: %+v\n", kv.me, op)
+					handlerReply = kv.ShardCollection[shardNum].ModifyKV(op)
 				}
 				startOp := kv.waitOpMap[applyMsg.CommandIndex]
 				waitCh, existCh := kv.opWaitChs[applyMsg.CommandIndex]
@@ -309,7 +332,7 @@ func (kv *ShardKV) applyChHandler() {
 					// sent ErrLeader to all ch and close all ch
 					//kv.lock()
 					if len(kv.opWaitChs) > 0 {
-						fmt.Printf("[Peer %d] sent ErrLeader to all ch and close all ch\n", kv.me)
+						DPrintf("[Peer %d] sent ErrLeader to all ch and close all ch\n", kv.me)
 						for index, ch := range kv.opWaitChs {
 							ch <- OpHandlerReply{ErrWrongLeader, ""} // 理论上这里不会被阻塞，Op发起方应该在等待其返回
 							close(ch)
@@ -329,7 +352,7 @@ func (kv *ShardKV) applyChHandler() {
 			// applyMsg.SnapshotValid == false && applyMsg.CommandValid == false
 			kv.LeaderChange()
 		}
-		kv.CheckPersist(applyMsg)
+
 	}
 }
 
@@ -349,7 +372,7 @@ func (kv *ShardKV) LeaderChangeHandle(op Op) {
 		return
 	}
 	if len(kv.opWaitChs) > 0 {
-		fmt.Printf("[Peer %d] receive new Leader ApplyMsg, close all ch\n", kv.me)
+		DPrintf("[Peer %d] receive new Leader ApplyMsg, close all ch\n", kv.me)
 	}
 	//kv.unlock()
 	for index, ch := range kv.opWaitChs {

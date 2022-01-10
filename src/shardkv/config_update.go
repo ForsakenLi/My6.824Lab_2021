@@ -4,7 +4,9 @@ import "6.824/shardctrler"
 
 func (kv *ShardKV) updateConfig() {
 	kv.PullConfigTimer.Reset(PullConfigTimeout)
-
+	if _, isLeader := kv.rf.GetState(); !isLeader {
+		return
+	}
 	canUpdate := true
 	kv.lock("updateConfig")
 	for _, shard := range kv.ShardCollection {
@@ -33,8 +35,9 @@ func (kv *ShardKV) updateConfigHandle(nextConfig *shardctrler.Config)  {
 	defer kv.unlock("updateConfigHandle")
 	if nextConfig.Num == kv.nowConfig.Num + 1 {
 		kv.updateShardState(nextConfig)	// 更新分片state
-		kv.prevConfig = kv.nowConfig
 		kv.nowConfig = *nextConfig
+	} else {
+		DPrintf("[Peer %d] receive outdated or advanced config %+v", kv.me, nextConfig)
 	}
 }
 
@@ -49,7 +52,7 @@ func (kv *ShardKV) updateShardState(nextConfig *shardctrler.Config)  {
 			}
 		}
 		if kv.nowConfig.Shards[i] == kv.gid && nextConfig.Shards[i] != kv.gid {
-			// 本轮不属于自己的shard
+			// 新一轮不属于自己的shard
 			gid := nextConfig.Shards[i]
 			if gid != 0 {
 				kv.ShardCollection[i].State = Pushing

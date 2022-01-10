@@ -60,6 +60,9 @@ type Op struct {
 	ID               int
 	NewConfig		 shardctrler.Config
 	// Shard transfer
+	CleanShardNum	int
+	ReceiveShard	ShardData
+	ReceiveShardNum int
 }
 
 type OpHandlerReply struct {
@@ -83,8 +86,24 @@ type ShardData struct {
 	State	   ShardStatus
 }
 
-func (sd *ShardData) ModifyKV(op *Op) OpHandlerReply {
-	if !isRegularOp(op) {
+func (sd *ShardData) deepCopy() ShardData {
+	ver := make(map[int]int64)
+	for k, v := range sd.VersionMap {
+		ver[k] = v
+	}
+	kv := make(map[string]string)
+	for k, v := range sd.KvMap {
+		kv[k] = v
+	}
+	return ShardData{
+		VersionMap: ver,
+		KvMap:      kv,
+		State:      sd.State,
+	}
+}
+
+func (sd *ShardData) ModifyKV(op Op) OpHandlerReply {
+	if !isRegularOp(&op) {
 		panic("illegal modifyKV op type")
 	}
 	if sd.State == Pushing || sd.State == WaitPush {
@@ -122,7 +141,13 @@ func isRegularOp(op *Op) bool {
 	return false
 }
 
-const Debug = false
+//func deepCopy(dst, src interface{}) error {
+//	var buf bytes.Buffer
+//	if err := gob.NewEncoder(&buf).Encode(src); err != nil {
+//		return err
+//	}
+//	return gob.NewDecoder(bytes.NewBuffer(buf.Bytes())).Decode(dst)
+//}
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug {
