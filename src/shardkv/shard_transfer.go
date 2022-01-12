@@ -150,17 +150,28 @@ func (kv *ShardKV) startAndApply(command interface{}) OpHandlerReply {
 	}
 
 	doneChan := kv.getMsgChan(lastIndex)
+	//defer func(){
+	//	kv.mu.Lock()
+	//	defer kv.mu.Unlock()
+	//	if _, ok := kv.opWaitChs[lastIndex]; ok {
+	//		close(doneChan)
+	//		delete(kv.opWaitChs, lastIndex)
+	//	}
+	//}()
 	select {
 	case <-time.After(200 * time.Millisecond):
+		close(doneChan)
 		return OpHandlerReply{
 			Err: "Timeout",
 		}
 	case handlerReply := <-doneChan:
 		if handlerReply.Err != OK {
+			close(doneChan)
 			return handlerReply
 		}
 		term, isLeader := kv.rf.GetState()
 		if !isLeader || currentTerm != term {
+			close(doneChan)
 			return OpHandlerReply{
 				Err: ErrWrongLeader,
 			}
@@ -196,21 +207,24 @@ func (kv *ShardKV) cleanShardHandle(op *Op) {
 		return
 	}
 	for _, shardNum := range op.CleanShardNum {
-		kv.ShardCollection[shardNum] = &ShardData{
-			VersionMap: make(map[int]int64),
-			KvMap:      make(map[string]string),
-			State:      Regular,
+		if kv.ShardCollection[shardNum].State == Pushing {
+			kv.ShardCollection[shardNum] = &ShardData{
+				VersionMap: make(map[int]int64),
+				KvMap:      make(map[string]string),
+				State:      Regular,
+			}
 		}
 	}
 }
 
-func (kv *ShardKV) receiveShardHandle(op *Op) {
+func (kv *ShardKV) receiveShardHandle(op *Op, index int) {
 	kv.lock("receiveShardHandle")
 	defer kv.unlock("receiveShardHandle")
 	//if op.ConfigNum == kv.nowConfig.Num && kv.ShardCollection[op.ReceiveShardNum].State == WaitPush {
 	//	var copyShard = op.ReceiveShards.deepCopy()
 	//	kv.ShardCollection[op.ReceiveShardNum] = &copyShard
 	//}
+
 	if op.ConfigNum != kv.nowConfig.Num {
 		return
 	}
@@ -219,5 +233,11 @@ func (kv *ShardKV) receiveShardHandle(op *Op) {
 			copyShard := shardData.deepCopy()
 			kv.ShardCollection[shardNum] = &copyShard
 		}
+	}
+	if doneChan, ok := kv.opWaitChs[index]; ok {
+		reply := OpHandlerReply{Err: OK}
+		doneChan <- reply
+		delete(kv.opWaitChs, index)
+		close(doneChan)
 	}
 }

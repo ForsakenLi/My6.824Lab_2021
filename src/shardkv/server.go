@@ -302,7 +302,7 @@ func (kv *ShardKV) applyChHandler() {
 				continue
 			}
 			if op.Type == "ReceiveShards" {
-				kv.receiveShardHandle(&op)
+				kv.receiveShardHandle(&op, applyMsg.CommandIndex)
 				continue
 			}
 			if isRegularOp(&op) {

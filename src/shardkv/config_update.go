@@ -43,9 +43,6 @@ func (kv *ShardKV) updateConfigHandle(nextConfig *shardctrler.Config)  {
 
 func (kv *ShardKV) updateShardState(nextConfig *shardctrler.Config)  {
 	// already have lock
-	if nextConfig.Num != kv.nowConfig.Num + 1 {
-		return
-	}
 	for i := 0; i < shardctrler.NShards; i++ {
 		if kv.nowConfig.Shards[i] != kv.gid && nextConfig.Shards[i] == kv.gid {
 			// 新增的shard
