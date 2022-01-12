@@ -8,17 +8,16 @@ package shardkv
 // talks to the group that holds the key's shard.
 //
 
-import "6.824/labrpc"
-import "crypto/rand"
-import "math/big"
-import "6.824/shardctrler"
-import "time"
+import (
+	"6.824/labrpc"
+	"6.824/shardctrler"
+	"crypto/rand"
+	"fmt"
+	"math/big"
+	rand2 "math/rand"
+	"time"
+)
 
-//
-// which shard is a key in?
-// please use this function,
-// and please do not change it.
-//
 func key2shard(key string) int {
 	shard := 0
 	if len(key) > 0 {
@@ -35,19 +34,21 @@ func nrand() int64 {
 	return x
 }
 
-var myID = 0
-
 type Clerk struct {
-	sm       *shardctrler.Clerk
-	config   shardctrler.Config
-	make_end func(string) *labrpc.ClientEnd
+	sm      *shardctrler.Clerk
+	config  shardctrler.Config
+	makeEnd func(string) *labrpc.ClientEnd
 	// You will have to modify this struct.
-	ID int
-	version int64
-	lastServer int	// 上次联系为leader，下次直接从它开始就不用找了
+	clientId        int
+	requestId       int64
+	gid2LeaderIdMap map[int]int // gid -> leaderId
 }
 
-//
+func (ck *Clerk) num() string {
+	return fmt.Sprintf("%v-%v", ck.clientId, ck.requestId)
+}
+
+// MakeClerk
 // the tester calls MakeClerk.
 //
 // ctrlers[] is needed to call shardctrler.MakeClerk().
@@ -56,86 +57,124 @@ type Clerk struct {
 // Config.Groups[gid][i] into a labrpc.ClientEnd on which you can
 // send RPCs.
 //
-func MakeClerk(ctrlers []*labrpc.ClientEnd, make_end func(string) *labrpc.ClientEnd) *Clerk {
-	ck := new(Clerk)
-	ck.sm = shardctrler.MakeClerk(ctrlers)
-	ck.make_end = make_end
+func MakeClerk(ctrlers []*labrpc.ClientEnd, makeEnd func(string) *labrpc.ClientEnd) *Clerk {
+	rand2.Seed(time.Now().UnixNano())
+	ck := &Clerk{
+		sm:              shardctrler.MakeClerk(ctrlers),
+		config:          shardctrler.Config{},
+		makeEnd:         makeEnd,
+		clientId:        rand2.Int(),
+		gid2LeaderIdMap: make(map[int]int),
+	}
 	// You'll have to add code here.
-	ck.ID = myID
-	myID++
-	ck.version = nrand()
 	return ck
 }
 
-//
+// Get
 // fetch the current value for a key.
 // returns "" if the key does not exist.
 // keeps trying forever in the face of all other errors.
 // You will have to modify this function.
 //
 func (ck *Clerk) Get(key string) string {
-	args := GetArgs{}
-	args.Key = key
+	ck.requestId++
+	args := GetArgs{
+		Key:       key,
+		//ClientId:  ck.clientId,
+		//RequestId: ck.requestId,
+	}
 
+	/**
+	1. 先 key2shard，拿到 key 对应的 shard
+	2. shard -> gid，映射拿到对应负责该 shard 的 gid
+	3. gid -> servers，在一个 raft 副本组内逐个 server 尝试，失败直到拿到 leader
+	4. 请求 leader
+	*/
+
+	shard := key2shard(key)
+	// 外层循环：找到一个 group
 	for {
-		shard := key2shard(key)
-		gid := ck.config.Shards[shard]
-		if servers, ok := ck.config.Groups[gid]; ok {
-			// try each server for the shard.
-			for si := 0; si < len(servers); si++ {
-				srv := ck.make_end(servers[si])
-				var reply GetReply
-				ok := srv.Call("ShardKV.Get", &args, &reply)
-				if ok && (reply.Err == OK || reply.Err == ErrNoKey) {
-					return reply.Value
+		// 1. 能从配置中拿到有效的 gid
+		if gid := ck.config.Shards[shard]; gid != 0 {
+			leaderId := ck.gid2LeaderIdMap[gid]
+			oldLeaderId := leaderId
+			// 2. 继续从配置中用 gid 拿到有效的 group 信息
+			if group, ok := ck.config.Groups[gid]; ok {
+				// 内层循环：在一个 group 里找 leader
+				for {
+					var reply GetReply
+					serverName := group[leaderId]
+					ok := ck.sendGet(serverName, &args, &reply)
+					if ok && (reply.Err == OK || reply.Err == ErrNoKey) {
+						ck.gid2LeaderIdMap[gid] = leaderId // 记录下该 gid 对应的 leader
+						return reply.Value
+					}
+					if ok && reply.Err == ErrWrongGroup {
+						break
+					}
+					// ... not ok, or ErrWrongLeader or timeout
+					leaderId = (leaderId + 1) % len(group)
+					// 请求了一个周期都不行，再尝试拉取最新配置重新请求
+					if leaderId == oldLeaderId {
+						break
+					}
 				}
-				if ok && (reply.Err == ErrWrongGroup) {
-					break
-				}
-				// ... not ok, or ErrWrongLeader
 			}
 		}
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(50 * time.Millisecond)
 		// ask controler for the latest configuration.
 		ck.config = ck.sm.Query(-1)
 	}
-
-	return ""
 }
 
-//
+// PutAppend
 // shared by Put and Append.
 // You will have to modify this function.
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
-	ck.version++
-	args := PutAppendArgs{}
-	args.Key = key
-	args.Value = value
-	args.Op = op
-	args.ClientID = ck.ID
-	args.Version = ck.version
+	ck.requestId++
+	args := PutAppendArgs{
+		Key:       key,
+		Value:     value,
+		Op:        op,
+		ClientID:  ck.clientId,
+		Version: ck.requestId,
+	}
 
+	shard := key2shard(key)
+	// 外层循环：找到一个 group
 	for {
-		shard := key2shard(key)
-		gid := ck.config.Shards[shard]
-		if servers, ok := ck.config.Groups[gid]; ok {
-			for si := 0; si < len(servers); si++ {
-				srv := ck.make_end(servers[si])
-				var reply PutAppendReply
-				ok := srv.Call("ShardKV.PutAppend", &args, &reply)
-				if ok && reply.Err == OK {
-					return
+		// 1. 能从配置中拿到有效的 gid
+		if gid := ck.config.Shards[shard]; gid != 0 {
+			leaderId := ck.gid2LeaderIdMap[gid]
+			oldLeaderId := leaderId
+			// 2. 继续从配置中用 gid 拿到有效的 group 信息
+			if group, ok := ck.config.Groups[gid]; ok {
+				// 内层循环：在一个 group 里找 leader
+				for {
+					var reply PutAppendReply
+					serverName := group[leaderId]
+					ok := ck.sendPutAppend(serverName, &args, &reply)
+					if ok && (reply.Err == OK || reply.Err == ErrNoKey) {
+						ck.gid2LeaderIdMap[gid] = leaderId // 记录下该 gid 对应的 leader
+						return
+					}
+					if ok && reply.Err == ErrWrongGroup {
+						break
+					}
+					// ... not ok, or ErrWrongLeader or timeout
+					leaderId = (leaderId + 1) % len(group)
+					// 请求了一个周期都不行，再尝试拉取最新配置重新请求
+					if leaderId == oldLeaderId {
+						break
+					}
 				}
-				if ok && reply.Err == ErrWrongGroup {
-					break
-				}
-				// ... not ok, or ErrWrongLeader
 			}
 		}
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(50 * time.Millisecond)
 		// ask controler for the latest configuration.
 		ck.config = ck.sm.Query(-1)
+		//DPrintf("[PutAppend] %v %v %v", ck.num(), ck.config.Num, ck.config.Shards)
 	}
 }
 
@@ -144,4 +183,14 @@ func (ck *Clerk) Put(key string, value string) {
 }
 func (ck *Clerk) Append(key string, value string) {
 	ck.PutAppend(key, value, "Append")
+}
+
+func (ck *Clerk) sendGet(serverName string, args *GetArgs, reply *GetReply) bool {
+	srv := ck.makeEnd(serverName)
+	return srv.Call("ShardKV.Get", args, reply)
+}
+
+func (ck *Clerk) sendPutAppend(serverName string, args *PutAppendArgs, reply *PutAppendReply) bool {
+	srv := ck.makeEnd(serverName)
+	return srv.Call("ShardKV.PutAppend", args, reply)
 }

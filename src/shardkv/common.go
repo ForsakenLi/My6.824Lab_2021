@@ -60,9 +60,10 @@ type Op struct {
 	ID               int
 	NewConfig		 shardctrler.Config
 	// Shard transfer
-	CleanShardNum	int
-	ReceiveShard	ShardData
-	ReceiveShardNum int
+	CleanShardNum   []int
+	//ReceiveShards   []ShardData
+	//ReceiveShardNum int
+	ReceiveShardMap	map[int]ShardData
 	ConfigNum		int		// for both clean and push
 }
 

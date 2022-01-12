@@ -301,7 +301,7 @@ func (kv *ShardKV) applyChHandler() {
 				kv.cleanShardHandle(&op)
 				continue
 			}
-			if op.Type == "ReceiveShard" {
+			if op.Type == "ReceiveShards" {
 				kv.receiveShardHandle(&op)
 				continue
 			}
@@ -365,31 +365,29 @@ func (kv *ShardKV) CheckPersist(applyMsg raft.ApplyMsg) {
 }
 
 func (kv *ShardKV) LeaderChangeHandle(op Op) {
-	// op.Type == "LeaderChange"
-	kv.lock("LeaderChangeHandle")
-	if op.ID == kv.me { // ignore this Op
-		kv.unlock("LeaderChangeHandle")
-		return
-	}
-	if len(kv.opWaitChs) > 0 {
-		DPrintf("[Peer %d Group %d] receive new Leader ApplyMsg, close all ch\n", kv.me, kv.gid)
-	}
-	//kv.unlock()
-	for index, ch := range kv.opWaitChs {
-		ch <- OpHandlerReply{ErrWrongLeader, ""}
-		close(ch)
-		delete(kv.opWaitChs, index)
-		delete(kv.waitOpMap, index)
-	}
-	kv.unlock("LeaderChangeHandle")
+	//kv.lock("LeaderChangeHandle")
+	//if op.ID == kv.me { // ignore this Op
+	//	kv.unlock("LeaderChangeHandle")
+	//	return
+	//}
+	//if len(kv.opWaitChs) > 0 {
+	//	DPrintf("[Peer %d Group %d] receive new Leader ApplyMsg, close all ch\n", kv.me, kv.gid)
+	//}
+	//for index, ch := range kv.opWaitChs {
+	//	ch <- OpHandlerReply{ErrWrongLeader, ""}
+	//	close(ch)
+	//	delete(kv.opWaitChs, index)
+	//	delete(kv.waitOpMap, index)
+	//}
+	//kv.unlock("LeaderChangeHandle")
 }
 
 func (kv *ShardKV) LeaderChange() {
-	kv.lock("LeaderChange")
-	newOp := Op{
-		Type: "LeaderChange",
-		ID:   kv.me, // 如果我收到这条消息，则不需要做推出chan的处理
-	}
-	kv.rf.Start(newOp)
-	kv.unlock("LeaderChange")
+	//kv.lock("LeaderChange")
+	//newOp := Op{
+	//	Type: "LeaderChange",
+	//	ID:   kv.me, // 如果我收到这条消息，则不需要做推出chan的处理
+	//}
+	//kv.rf.Start(newOp)
+	//kv.unlock("LeaderChange")
 }

@@ -35,7 +35,7 @@ func (kv *ShardKV) updateConfigHandle(nextConfig *shardctrler.Config)  {
 	defer kv.unlock("updateConfigHandle")
 	if nextConfig.Num == kv.nowConfig.Num + 1 {
 		kv.updateShardState(nextConfig)	// 更新分片state
-		kv.nowConfig = *nextConfig
+		kv.nowConfig = nextConfig.DeepCopy()
 	} else {
 		DPrintf("[Peer %d Group %d] receive outdated or advanced config %+v", kv.me, kv.gid ,nextConfig)
 	}
@@ -43,6 +43,9 @@ func (kv *ShardKV) updateConfigHandle(nextConfig *shardctrler.Config)  {
 
 func (kv *ShardKV) updateShardState(nextConfig *shardctrler.Config)  {
 	// already have lock
+	if nextConfig.Num != kv.nowConfig.Num + 1 {
+		return
+	}
 	for i := 0; i < shardctrler.NShards; i++ {
 		if kv.nowConfig.Shards[i] != kv.gid && nextConfig.Shards[i] == kv.gid {
 			// 新增的shard
@@ -56,6 +59,12 @@ func (kv *ShardKV) updateShardState(nextConfig *shardctrler.Config)  {
 			gid := nextConfig.Shards[i]
 			if gid != 0 {
 				kv.ShardCollection[i].State = Pushing
+			} else {
+				kv.ShardCollection[i] = &ShardData{
+					VersionMap: make(map[int]int64),
+					KvMap:      make(map[string]string),
+					State:      Regular,
+				}
 			}
 		}
 	}
