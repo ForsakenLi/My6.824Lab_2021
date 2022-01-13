@@ -78,7 +78,7 @@ func (kv *ShardKV) getPushingShardByGid() map[int][]int {
 	return res
 }
 
-func (kv *ShardKV) sendPushRPC (GID int, shardIDs []int) {
+func (kv *ShardKV) sendPushRPC(GID int, shardIDs []int) {
 	copyShards := make(map[int]ShardData)
 	kv.lock("CopyShardToPush")
 	for _, shardNum := range shardIDs {
@@ -160,7 +160,12 @@ func (kv *ShardKV) startAndApply(command interface{}) OpHandlerReply {
 	//}()
 	select {
 	case <-time.After(200 * time.Millisecond):
-		close(doneChan)
+		kv.mu.Lock()
+		if ch, ok := kv.opWaitChs[lastIndex]; ok {
+			close(ch)
+			delete(kv.opWaitChs, lastIndex)
+		}
+		kv.mu.Unlock()
 		return OpHandlerReply{
 			Err: "Timeout",
 		}

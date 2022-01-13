@@ -358,36 +358,36 @@ func (kv *ShardKV) applyChHandler() {
 
 func (kv *ShardKV) CheckPersist(applyMsg raft.ApplyMsg) {
 	kv.lock("CheckPersist")
-	if kv.maxraftstate != -1 && float32(kv.persister.RaftStateSize()) > float32(kv.maxraftstate)*0.9 {
+	if kv.maxraftstate != -1 && float32(kv.persister.RaftStateSize()) > float32(kv.maxraftstate) * 0.9 {
 		kv.rf.Snapshot(applyMsg.CommandIndex, kv.getPersistStateBytes())
 	}
 	kv.unlock("CheckPersist")
 }
 
 func (kv *ShardKV) LeaderChangeHandle(op Op) {
-	//kv.lock("LeaderChangeHandle")
-	//if op.ID == kv.me { // ignore this Op
-	//	kv.unlock("LeaderChangeHandle")
-	//	return
-	//}
-	//if len(kv.opWaitChs) > 0 {
-	//	DPrintf("[Peer %d Group %d] receive new Leader ApplyMsg, close all ch\n", kv.me, kv.gid)
-	//}
-	//for index, ch := range kv.opWaitChs {
-	//	ch <- OpHandlerReply{ErrWrongLeader, ""}
-	//	close(ch)
-	//	delete(kv.opWaitChs, index)
-	//	delete(kv.waitOpMap, index)
-	//}
-	//kv.unlock("LeaderChangeHandle")
+	kv.lock("LeaderChangeHandle")
+	if op.ID == kv.me { // ignore this Op
+		kv.unlock("LeaderChangeHandle")
+		return
+	}
+	if len(kv.opWaitChs) > 0 {
+		DPrintf("[Peer %d Group %d] receive new Leader ApplyMsg, close all ch\n", kv.me, kv.gid)
+	}
+	for index, ch := range kv.opWaitChs {
+		ch <- OpHandlerReply{ErrWrongLeader, ""}
+		close(ch)
+		delete(kv.opWaitChs, index)
+		delete(kv.waitOpMap, index)
+	}
+	kv.unlock("LeaderChangeHandle")
 }
 
 func (kv *ShardKV) LeaderChange() {
-	//kv.lock("LeaderChange")
-	//newOp := Op{
-	//	Type: "LeaderChange",
-	//	ID:   kv.me, // 如果我收到这条消息，则不需要做推出chan的处理
-	//}
-	//kv.rf.Start(newOp)
-	//kv.unlock("LeaderChange")
+	kv.lock("LeaderChange")
+	newOp := Op{
+		Type: "LeaderChange",
+		ID:   kv.me, // 如果我收到这条消息，则不需要做推出chan的处理
+	}
+	kv.rf.Start(newOp)
+	kv.unlock("LeaderChange")
 }
