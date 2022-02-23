@@ -113,6 +113,7 @@ func (kv *ShardKV) sendPushRPC(GID int, shardIDs []int) {
 					ConfigNum:     configNum,
 				}
 				kv.rf.Start(cleanOp)
+				//kv.startAndApply(cleanOp)
 			}
 		}
 	}
@@ -171,12 +172,22 @@ func (kv *ShardKV) startAndApply(command interface{}) OpHandlerReply {
 		}
 	case handlerReply := <-doneChan:
 		if handlerReply.Err != OK {
-			close(doneChan)
+			kv.mu.Lock()
+			if ch, ok := kv.opWaitChs[lastIndex]; ok {
+				close(ch)
+				delete(kv.opWaitChs, lastIndex)
+			}
+			kv.mu.Unlock()
 			return handlerReply
 		}
 		term, isLeader := kv.rf.GetState()
 		if !isLeader || currentTerm != term {
-			close(doneChan)
+			kv.mu.Lock()
+			if ch, ok := kv.opWaitChs[lastIndex]; ok {
+				close(ch)
+				delete(kv.opWaitChs, lastIndex)
+			}
+			kv.mu.Unlock()
 			return OpHandlerReply{
 				Err: ErrWrongLeader,
 			}
@@ -201,13 +212,6 @@ func (kv *ShardKV) getMsgChan(index int) chan OpHandlerReply {
 func (kv *ShardKV) cleanShardHandle(op *Op) {
 	kv.lock("cleanShardHandle")
 	defer kv.unlock("cleanShardHandle")
-	//if op.ConfigNum == kv.nowConfig.Num && kv.ShardCollection[op.CleanShardNum].State == Pushing {
-	//	kv.ShardCollection[op.CleanShardNum] = &ShardData{
-	//		VersionMap: make(map[int]int64),
-	//		KvMap:      make(map[string]string),
-	//		State:      Regular,
-	//	}
-	//}
 	if op.ConfigNum != kv.nowConfig.Num {
 		return
 	}

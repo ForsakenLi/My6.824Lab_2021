@@ -157,3 +157,13 @@ Checkpoint saved in `branch: Lab_3A_KV_WIO_Snapshots`.
 而push模式则没有这个问题, Shard发送方主动的在push RPC的Args中发送分片数据给接收方, 接收方在确认数据收到后才会返回这个reply, 接收方收到RPC的reply后马上就可以删除这个之前的分片, 少了一个RPC。就算这个接收方返回的reply没收到, 发送方重新push了, 我们也可以根据分片的状态和config版本号来确认：只有当push Args中发送方的Config版本号和当前自己的版本号一致, 且该分片处于waitPush状态才会接收这个push传来的数据。这样就保证了数据迁移的安全性。
 
 至于分区清理的安全性, 由于采用了push模式, 只要分片发送方收到push RPC的reply, 即可认为数据安全到达, 此时立即删除分片数据即可, 不必和pull模式一样再设置一个ack RPC, 收到确认后再进行删除。
+
+#### Debug:
+
+本实验主要的bug围绕以下几点:
+
+1. 关于发送Push RPC Config版本号的验证: 在之前的版本，我将这个RPC Config版本号验证的位置放在了Push RPC接收的入口处, 当Leader收到一条和自身Config版本号相同的PushShard请求，且自身的Shard状态为WaitPush，就立刻给Push发送方返回OK。这种设计存在一个缺陷，假如目前场上原先的Leader被孤立了，根据raft选举机制场面上会出现一个多数派Leader和少数派Leader，当我们作为发送方，发送Push RPC如果少数派的Leader接收到了我们的PushShard，少数派会返回一个无效的OK给调用方，这会导致调用方错误的GC了原先的需要push的数据片，而现在该group真正的多数派leader却没有收到。中间我改为返回过OK的Group大于等于1才进行GC，发现同样无法成功，可能还是少数派Leader的错误回复导致。其实这个问题的核心在于对状态机的流程思考不深入导致的，事实上无论是PutAppend，还是配置更新和分片迁移，group的Leader仅仅是这个操作的发起者，真正执行的时刻是要在raft集群半数以上的机器Commit这个操作，并通过applyCh返回到上一级时。那么我们如何确认这个PushShard操作的日志真正被raft的半数以上机器commit了，是在多数派Leader通过applyCh收到这个Push时，因为少数派Leader的Start因为网络分区的原因提交是不可能获得半数以上支持的，因此正确的设计是当多数派Leader通过applyCh收到Push的日志才会给Push RPC发起方返回OK。
+
+2. 循环变量在协程内的作用范围: 如果我们将for-each的迭代变量直接在协程内使用，会导致协程内部的变量出现混乱，因为编译器在处理协程内出现的外部变量时，采取的是传址的方式，外部变量的变化会导致内部变量出现变化，因此我们需要将这些变量以协程参数的形式传入。
+
+3. 数据的深拷贝问题: 在使用RPC传递和Raft发送的日志时，我们需要重新对数据进行深拷贝后再进行使用。

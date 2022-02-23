@@ -324,13 +324,10 @@ func (kv *ShardKV) applyChHandler() {
 					waitCh <- handlerReply
 					// close channel and delete the index from waitMap
 					close(waitCh)
-					//kv.lock()
 					delete(kv.opWaitChs, applyMsg.CommandIndex)
 					delete(kv.waitOpMap, applyMsg.CommandIndex)
-					//kv.unlock()
 				} else {
 					// sent ErrLeader to all ch and close all ch
-					//kv.lock()
 					if len(kv.opWaitChs) > 0 {
 						DPrintf("[Peer %d Group %d] sent ErrLeader to all ch and close all ch\n", kv.me, kv.gid)
 						for index, ch := range kv.opWaitChs {

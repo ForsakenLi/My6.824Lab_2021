@@ -15,8 +15,11 @@ import (
 	"fmt"
 	"math/big"
 	rand2 "math/rand"
+	"sync/atomic"
 	"time"
 )
+
+var inc = 0
 
 func key2shard(key string) int {
 	shard := 0
@@ -63,9 +66,10 @@ func MakeClerk(ctrlers []*labrpc.ClientEnd, makeEnd func(string) *labrpc.ClientE
 		sm:              shardctrler.MakeClerk(ctrlers),
 		config:          shardctrler.Config{},
 		makeEnd:         makeEnd,
-		clientId:        rand2.Int(),
+		clientId:        rand2.Int() + inc,
 		gid2LeaderIdMap: make(map[int]int),
 	}
+	inc++
 	// You'll have to add code here.
 	return ck
 }
@@ -77,20 +81,11 @@ func MakeClerk(ctrlers []*labrpc.ClientEnd, makeEnd func(string) *labrpc.ClientE
 // You will have to modify this function.
 //
 func (ck *Clerk) Get(key string) string {
-	ck.requestId++
+	//ck.requestId++
+	//atomic.AddInt64(&ck.requestId, 1)
 	args := GetArgs{
 		Key:       key,
-		//ClientId:  ck.clientId,
-		//RequestId: ck.requestId,
 	}
-
-	/**
-	1. 先 key2shard，拿到 key 对应的 shard
-	2. shard -> gid，映射拿到对应负责该 shard 的 gid
-	3. gid -> servers，在一个 raft 副本组内逐个 server 尝试，失败直到拿到 leader
-	4. 请求 leader
-	*/
-
 	shard := key2shard(key)
 	// 外层循环：找到一个 group
 	for {
@@ -121,7 +116,7 @@ func (ck *Clerk) Get(key string) string {
 				}
 			}
 		}
-		time.Sleep(50 * time.Millisecond)
+		time.Sleep(30 * time.Millisecond)
 		// ask controler for the latest configuration.
 		ck.config = ck.sm.Query(-1)
 	}
@@ -132,7 +127,8 @@ func (ck *Clerk) Get(key string) string {
 // You will have to modify this function.
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
-	ck.requestId++
+	//ck.requestId++
+	atomic.AddInt64(&ck.requestId, 1)
 	args := PutAppendArgs{
 		Key:       key,
 		Value:     value,
