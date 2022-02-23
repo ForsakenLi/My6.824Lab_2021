@@ -46,6 +46,7 @@ func TestStaticShards(t *testing.T) {
 		check(t, ck, ka[i], va[i])
 	}
 
+	t.Log("shotdown")
 	// make sure that the data really is sharded by
 	// shutting down one shard and checking that some
 	// Get()s don't succeed.
@@ -236,13 +237,15 @@ func TestMissChange(t *testing.T) {
 	for i := 0; i < n; i++ {
 		check(t, ck, ka[i], va[i])
 	}
-
+	t.Log("group 0 -> group 1 & 0")
 	cfg.join(1)
 
+	t.Log("all groups peer 0 will isolated")
 	cfg.ShutdownServer(0, 0)
 	cfg.ShutdownServer(1, 0)
 	cfg.ShutdownServer(2, 0)
 
+	t.Log("group 1 & 0 -> group 2")
 	cfg.join(2)
 	cfg.leave(1)
 	cfg.leave(0)
@@ -254,6 +257,7 @@ func TestMissChange(t *testing.T) {
 		va[i] += x
 	}
 
+	t.Log("group 2 -> group 1 & 2")
 	cfg.join(1)
 
 	for i := 0; i < n; i++ {
@@ -263,6 +267,7 @@ func TestMissChange(t *testing.T) {
 		va[i] += x
 	}
 
+	t.Log("all groups peer 0 will back")
 	cfg.StartServer(0, 0)
 	cfg.StartServer(1, 0)
 	cfg.StartServer(2, 0)
@@ -276,10 +281,12 @@ func TestMissChange(t *testing.T) {
 
 	time.Sleep(2 * time.Second)
 
+	t.Log("all groups peer 1 will isolated")
 	cfg.ShutdownServer(0, 1)
 	cfg.ShutdownServer(1, 1)
 	cfg.ShutdownServer(2, 1)
 
+	t.Log("group 1 & 2 -> group 1 & 0")
 	cfg.join(0)
 	cfg.leave(2)
 
@@ -290,6 +297,7 @@ func TestMissChange(t *testing.T) {
 		va[i] += x
 	}
 
+	t.Log("all groups peer 2 will isolated")
 	cfg.StartServer(0, 1)
 	cfg.StartServer(1, 1)
 	cfg.StartServer(2, 1)

@@ -28,6 +28,24 @@ type Config struct {
 	Groups map[int][]string // gid -> servers[]
 }
 
+func (cf *Config) DeepCopy() Config {
+	var s [NShards]int
+	for i := 0; i<NShards; i++ {
+		s[i] = cf.Shards[i]
+	}
+	group := make(map[int][]string)
+	for k, sli := range cf.Groups {
+		nwSli := make([]string, 0)
+		nwSli = append(nwSli, sli...)
+		group[k] = nwSli
+	}
+	return Config{
+		Num: cf.Num,
+		Shards: s,
+		Groups: group,
+	}
+}
+
 const (
 	OK   = "OK"
 	FAIL = "FAIL"
