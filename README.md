@@ -87,9 +87,9 @@ Function fast review:
 
 4. GetState: 外部调用, 用于检查集群节点状态。
 
-5. InstallSnapshot: 内部RPC, 当Leader完成对Follower的AppendEntries, 如果这个Follower返回的NextIndex的值小于该Leader的LastIncludedIndex(相当于这个Follower没有达到上一个快照点), 就会给这个Follower发送这个快照。InstallSnapshot接收方并不会立刻装载这个镜像, 而是先在ApplyCh中发送将要装载这个镜像的请求给用户服务, 真正装载这个快照则是在CondInstallSnapshot被外部调用之后。
+5. InstallSnapshot: 内部RPC, 当Leader完成对Follower的AppendEntries, 如果这个Follower返回的NextIndex的值小于该Leader的LastIncludedIndex(相当于这个Follower没有达到上一个快照点), 就会给这个Follower发送这个快照。InstallSnapshot接收方并不会立刻装载这个镜像, 而是先在ApplyCh中发送将要装载这个镜像的请求发送到上层状态机，上层状态机通过CondInstallSnapshot与Raft层一起原子地完成镜像的装载。
 
-6. CondInstallSnapshot: 外部调用, 外部Server层确认一个镜像可以被装载后, 也就是从applyCh中收到Snapshot请求后, 通过发起CondInstallSnapshot调用确认Raft层可以安装这个镜像。
+6. CondInstallSnapshot: 外部调用, 这个方法是为了保证镜像装载的原子性, 因为在创建快照时不仅包括Raft层的快照信息，还包括Server层的快照信息, 我们在装载快照时上层状态机希望和Raft层同时切换到一个快照点，因此通过该调用保证装载时能够同步地完成切换。
 
 7. Snapshot: 外部调用, 当Server层希望创建一个镜像时, 会通过这个调用告诉Raft层希望快照的index, 并会将Server层和Raft层的所有需要保存的数据一并存入persister。
 
@@ -144,7 +144,7 @@ Checkpoint saved in `branch: Lab_3A_KV_WIO_Snapshots`.
 
 这个问题我思考了很久, 这个问题的解决方案是：我为Shard加上了一个WaitPush状态, 同时确定了Config更新的条件：当所有分片都为Regular状态时, 才能更新到下一个版本的Config。通过这两点我们就可以保证Config更新的原子性, 一旦一个raft组从controller处拉取了下个版本的config, 无论它本轮是Shard的接收方还是发送方或二者皆有, 在完成分片的交换前它都无法更新到下个配置(WaitPush是制约接收方的, 如果它发现本轮要接收分片就必须等待分片到达才能继续更新Config)。由于这个限制对于接收双方都存在, 如果一个raft组对外表现为不工作状态, 那么所有依赖其数据的raft组无论是要发给它还是需要它的分片, 全部都会停留在当前config上, 形成一个故障raft组集合(其实分片读写还是ok的, 只是配置不会更新了)；如果后续还有config更新, 则所有和这个故障raft组集合中任意raft组有分片交换需求的raft组都会无法更新config, 最终甚至可能所有raft组都无法更新配置。
 
-其实对外看来, 整个multi-raft集群真正出现读写故障的只有最初那个raft组上的分片, 以及更新config版本的故障, 在生产环境中这种仅一个raft组出现故障的概率其实很低。这个Lab4实验据Morris教授所说, 原型是Google的Spanner, 在6.824这一课程中我们曾读过Spanner的论文, 在Spanner中每个raft组的物理机都位于多个DataCenter, 而不同的raft组下层DataCenter组是一致的, 很可能一个DataCenter拥有属于不同raft组的多个实例, 而一旦出现了一个raft组大部分机器都crash也很可能意味着多个不止一个raft组crash了, 这种情况自然也超过了multi-raft集群安全性的讨论范围。
+其实对外看来, 整个multi-raft集群真正出现读写故障的只有最初那个raft组上的分片, 以及更新config版本的故障, 在生产环境中这种仅一个raft组出现故障的概率其实很低。这个Lab4实验据Morris教授所说, 原型是Google的Spanner, 在6.824这一课程中我们曾读过Spanner的论文, 在Spanner中每个Paxos组的物理机都位于多个DataCenter, 而不同的Paxos组下层DataCenter组是一致的, 很可能一个DataCenter拥有属于不同Paxos组的多个实例, 而一旦出现了一个Paxos组大部分机器都crash也很可能意味着多个不止一个Paxos组crash了, 这种情况自然也超过了multi-raft集群安全性的讨论范围。
 
 ![Spanner](src/image/spanner.png)
 
@@ -167,3 +167,5 @@ Checkpoint saved in `branch: Lab_3A_KV_WIO_Snapshots`.
 2. 循环变量在协程内的作用范围: 如果我们将for-each的迭代变量直接在协程内使用，会导致协程内部的变量出现混乱，因为编译器在处理协程内出现的外部变量时，采取的是传址的方式，外部变量的变化会导致内部变量出现变化，因此我们需要将这些变量以协程参数的形式传入。
 
 3. 数据的深拷贝问题: 在使用RPC传递和Raft发送的日志时，我们需要重新对数据进行深拷贝后再进行使用。
+
+4. Lab 4B需要保证所有操作的幂等性，在apply 迁移操作/GC操作/更新版本操作时(Op操作也会通过去重表保证幂等性, 因为重试发送的push是不会增加版本号的)，我们需要确定这个操作是属于当前版本的config，且状态位必须是正确的，更新版本版本更新号必须只能更新到当前版本号+1等；究其原因是因为在网络不可靠的环境下所有操作都可能发生重试(这些重试也会记录在WAL中)，我们必须保证所有操作都是适用于当前状态机状态的，这就是保证线性化语义的精髓
